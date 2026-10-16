@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: research-scout-postgres
+    environment:
+      POSTGRES_USER: research
+      POSTGRES_PASSWORD: research
+      POSTGRES_DB: research_scout
+    ports:
+      - "55433:5432"
+    volumes:
+      - research_scout_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research -d research_scout"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  research_scout_pgdata:

@@ -1,14 +1,4 @@
 .DS_Store
-.env
-.env.*
-!.env.example
-config.local.yaml
-config.local.*
+eval/reports/*.json
+research-scout
 *.log
-tmp/
-dist/
-build/
-node_modules/
-.swiftpm/
-DerivedData/
-xcuserdata/

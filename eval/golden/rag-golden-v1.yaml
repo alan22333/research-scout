@@ -1,0 +1,12 @@
+version: rag-golden-v1
+questions:
+  - id: q-hybrid-retrieval
+    intent: mechanism_comparison
+    question: hybrid retrieval reciprocal rank fusion
+    expected_terms: [reciprocal rank fusion, citation traceability]
+    min_evidence: 1
+  - id: q-grounding
+    intent: find_gap
+    question: grounded citations retrieval coverage RAG benchmark
+    expected_terms: [grounded citations, retrieval coverage]
+    min_evidence: 1

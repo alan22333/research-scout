@@ -1,0 +1,49 @@
+version: stage0-v1
+connection:
+  library_id: local-fixture
+  provider: web_api
+  library_type: user
+collections:
+  - key: COLL-RETRIEVAL
+    name: Retrieval & RAG
+  - key: COLL-EVALUATION
+    name: Evaluation
+documents:
+  - key: ITEM-FULLTEXT-001
+    title: Hybrid Retrieval for Scientific Literature
+    abstract: We study lexical and dense retrieval for scientific question answering.
+    year: 2024
+    venue: SIGIR
+    doi: 10.1000/stage0.fulltext
+    item_type: conferencePaper
+    collections: [COLL-RETRIEVAL]
+    authors: [Ada Example, Ben Fixture]
+    zotero_version: 101
+    fulltext: |
+      Hybrid retrieval for scientific literature combines lexical search with dense retrieval.
+      We apply reciprocal rank fusion to merge sparse and dense candidate lists before reranking.
+      The evaluation shows that reciprocal rank fusion improves recall while preserving citation traceability.
+
+      The system filters stale document versions and pins every query to an immutable index epoch.
+      This prevents partially built indexes from leaking into research answers.
+  - key: ITEM-ABSTRACT-002
+    title: Evaluation of Retrieval Augmented Generation
+    abstract: A benchmark for evaluating grounded citations, answer faithfulness, and retrieval coverage in RAG systems.
+    year: 2023
+    venue: EMNLP
+    doi: 10.1000/stage0.abstract
+    item_type: journalArticle
+    collections: [COLL-EVALUATION]
+    authors: [Chen Fixture]
+    zotero_version: 102
+  - key: ITEM-METADATA-003
+    title: Unindexed Full-Text Candidate
+    abstract: ""
+    year: 2025
+    venue: Unknown
+    doi: 10.1000/stage0.metadata-only
+    item_type: journalArticle
+    collections: [COLL-EVALUATION]
+    authors: [Metadata Only]
+    zotero_version: 103
+    fulltext: ""
