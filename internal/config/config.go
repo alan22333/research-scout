@@ -19,6 +19,7 @@ type Config struct {
 	ZoteroAPIBase               string
 	ZoteroAPIVersion            string
 	ZoteroRequestConcurrency    int
+	SecretKey                   string
 	S2APIKey                    string
 	OpenAlexEmail               string
 	LLMBaseURL                  string
@@ -64,6 +65,7 @@ func Load() (Config, error) {
 		ZoteroAPIBase:               env("ZOTERO_API_BASE", "https://api.zotero.org"),
 		ZoteroAPIVersion:            env("ZOTERO_API_VERSION", "3"),
 		ZoteroRequestConcurrency:    envInt("ZOTERO_REQUEST_CONCURRENCY", 4),
+		SecretKey:                   env("SECRET_KEY", "local-dev-secret-change-me"),
 		S2APIKey:                    os.Getenv("S2_API_KEY"),
 		OpenAlexEmail:               os.Getenv("OPENALEX_EMAIL"),
 		LLMBaseURL:                  os.Getenv("LLM_BASE_URL"),

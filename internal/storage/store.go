@@ -218,7 +218,6 @@ func (s *Store) CreateProject(ctx context.Context, p Project) (Project, error) {
 	if err != nil {
 		return Project{}, err
 	}
-	p.WorkspaceID = p.WorkspaceID
 	return p, nil
 }
 

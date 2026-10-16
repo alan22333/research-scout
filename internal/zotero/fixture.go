@@ -118,7 +118,11 @@ func (f Fixture) contentHash(d FixtureDocument) string {
 }
 
 func normalizeDOI(doi string) string {
-	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(doi, "https://doi.org/")))
+	value := strings.ToLower(strings.TrimSpace(doi))
+	value = strings.TrimPrefix(value, "https://doi.org/")
+	value = strings.TrimPrefix(value, "http://doi.org/")
+	value = strings.TrimPrefix(value, "doi:")
+	return strings.TrimSpace(value)
 }
 
 type Importer struct {

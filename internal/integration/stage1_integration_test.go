@@ -158,14 +158,14 @@ func (s *fakeZoteroSource) GetFulltext(_ context.Context, _ zotero.Credential, k
 
 func newStage1Syncer(store *storage.Store, source zotero.Source, now time.Time) *zotero.Syncer {
 	return &zotero.Syncer{
-		Store: store,
-		Source: source,
+		Store:       store,
+		Source:      source,
 		Credentials: &fakeCredentialStore{},
 		Config: zotero.SyncConfig{
-			EmbeddingVersion:      "stage1-test-embedding-v1",
-			EmbeddingDim:          1024,
+			EmbeddingVersion:       "stage1-test-embedding-v1",
+			EmbeddingDim:           1024,
 			RetrievalConfigVersion: "retrieval-v1",
-			Now:                   func() time.Time { return now },
+			Now:                    func() time.Time { return now },
 		},
 	}
 }
@@ -187,10 +187,10 @@ func TestSyncFullPublishesIndexAndIsIdempotent(t *testing.T) {
 	if got := source.sinceCalls; len(got) != 1 || got[0] != 0 {
 		t.Fatalf("full sync since calls=%v", got)
 	}
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE removed_at IS NULL`, 3)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions`, 3)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM chunks`, 2)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM index_epochs WHERE status='active'`, 1)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE workspace_id=$1 AND removed_at IS NULL`, 3)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions WHERE workspace_id=$1`, 3)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM chunks WHERE workspace_id=$1`, 2)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM index_epochs WHERE workspace_id=$1 AND status='active'`, 1)
 	if err := store.Pool().QueryRow(context.Background(), `
 		SELECT last_library_version FROM zotero_connections WHERE workspace_id=$1 AND library_id='user-1'
 	`, workspaceID).Scan(new(int64)); err != nil {
@@ -204,9 +204,9 @@ func TestSyncFullPublishesIndexAndIsIdempotent(t *testing.T) {
 	if second.NewEpoch || second.Documents != 3 || second.VersionsAdded != 0 || second.Chunks != 0 {
 		t.Fatalf("second sync was not idempotent: %+v", second)
 	}
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE removed_at IS NULL`, 3)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions`, 3)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM chunks`, 2)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE workspace_id=$1 AND removed_at IS NULL`, 3)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions WHERE workspace_id=$1`, 3)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM chunks WHERE workspace_id=$1`, 2)
 }
 
 func TestSyncIncrementalUpdatesAndTombstones(t *testing.T) {
@@ -237,10 +237,10 @@ func TestSyncIncrementalUpdatesAndTombstones(t *testing.T) {
 	if calls := source.sinceCalls; len(calls) != 2 || calls[1] != 10 {
 		t.Fatalf("since calls=%v", calls)
 	}
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE removed_at IS NULL`, 2)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE removed_at IS NOT NULL`, 1)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM lifecycle_tombstones WHERE object_type='document' AND status='active'`, 1)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions WHERE document_id=(SELECT id FROM documents WHERE zotero_item_key='item-a')`, 2)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE workspace_id=$1 AND removed_at IS NULL`, 2)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM documents WHERE workspace_id=$1 AND removed_at IS NOT NULL`, 1)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM lifecycle_tombstones WHERE workspace_id=$1 AND object_type='document' AND status='active'`, 1)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions WHERE workspace_id=$1 AND document_id=(SELECT id FROM documents WHERE workspace_id=$1 AND zotero_item_key='item-a')`, 2)
 
 	var purgeAfter time.Time
 	if err := store.Pool().QueryRow(context.Background(), `
@@ -255,8 +255,8 @@ func TestSyncIncrementalUpdatesAndTombstones(t *testing.T) {
 	if _, err := zotero.PurgeDue(context.Background(), store, workspaceID, now.Add(31*24*time.Hour)); err != nil {
 		t.Fatalf("purge due: %v", err)
 	}
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM lifecycle_tombstones WHERE status='active'`, 0)
-	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions WHERE document_id=(SELECT id FROM documents WHERE workspace_id=$1 AND zotero_item_key='item-c')`, 0)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM lifecycle_tombstones WHERE workspace_id=$1 AND status='active'`, 0)
+	assertCount(t, store, workspaceID, `SELECT count(*) FROM document_versions WHERE workspace_id=$1 AND document_id=(SELECT id FROM documents WHERE workspace_id=$1 AND zotero_item_key='item-c')`, 0)
 }
 
 func TestSyncFailurePreservesActiveEpoch(t *testing.T) {

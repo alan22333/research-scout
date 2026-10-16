@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 状态 | Ready |
+| 状态 | Verified |
 | 日期 | 2026-10-17 |
 | 负责人 | Codex |
 | 上游依据 | PRD v1.4；架构基线 v1.1；技术设计包 v1.1；OpenAPI 1.1.0 |
@@ -125,4 +125,16 @@ Red 说明阶段 1 的 Web API source、凭据加密、同步器和生命周期�
 
 ### Green
 
-待实现完成后填写真实命令、脱敏计数和真实 Key 本地验证结果。
+2026-10-17 在本地 PostgreSQL/pgvector、脱敏 HTTP fixture 与真实只读 Zotero Web API 上实跑采集。所有命令均未输出或持久化明文 Key、私人全文或原始响应正文。
+
+- `make verify`：通过（OpenAPI YAML 解析、单元测试、Integration 测试、Contract 测试）。
+- `go test ./...`：通过；`go vet ./...`：无告警。
+- `RS_DATABASE_URL=... go test -race ./internal/zotero ./internal/credentials ./internal/integration -count=1`：通过。真实本地库与 fixture 共存时，最初暴露出集成测试使用全表计数导致跨 workspace 污染；测试已改为所有计数显式带 `workspace_id`，修正后 Race 测试通过。
+- `make migrate`：全新 schema 成功应用 `0001_stage0`、`0002_stage1_sync_indexes`；迁移文件可重复执行。
+- 首次真实 full sync（只读 Zotero Web API，library id `17424218`）：`new_epoch=true`、`documents=159`、`versions_added=159`、`chunks=8474`、`fulltext=149`、`abstracts=3`、`metadata_only=7`、`deleted=0`，耗时约 4.5 分钟。
+- 第二次真实 full sync：`new_epoch=false`、`versions_added=0`、`chunks=0`，证明文档、版本、chunk 与 active epoch 未重复创建。
+- 真实 incremental sync：连接游标已是 library version `10641` 时，`new_epoch=false`、`versions_added=0`、`chunks=0`；`sync-status` 显示 `last_library_version=10641`、`has_credential=true`、连接 coverage `fulltext=149`、`abstract=3`、`metadata_only=7`，文档 coverage `indexed=154`、`metadata_only=8`（后者含 Stage 0 fixture，因此不等于 Zotero 连接 coverage）。
+- `smoke-stage0` 与 `eval-rag`：通过，`hard_gate_failures=[]`、`retrieval_hit_rate=1`。
+- `purge-lifecycle`：命令通过；真实只读库没有到期 tombstone，因此返回 `purged=0`。tombstone 删除、30 天截止时间和到期清理由 `TestSyncIncrementalUpdatesAndTombstones`、`TestPurgeDueLifecycle` 覆盖。
+- 数据安全检查：仓库、日志、fixture 和数据库扫描均未发现测试 Key 明文；数据库凭据列为 `v1:` 前缀的 AES-GCM 密文。真实 Key 只保存在仓库外、权限为 `600` 的本机凭据文件中。
+- 已知限制：真实测试库当时没有可删除条目，删除分支使用 fake source 的集成测试覆盖；Zotero API 的付费/免费档限流表现可能随账户权限变化；Provider、LLM、前端、OAuth 和 Connector 仍不在阶段 1 范围。

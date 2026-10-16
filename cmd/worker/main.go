@@ -30,7 +30,7 @@ func main() {
 
 func run() error {
 	if len(os.Args) < 2 {
-		return fmt.Errorf("usage: worker <migrate|seed|import-fixture|smoke-stage0|eval-rag> [flags]")
+		return fmt.Errorf("usage: worker <migrate|seed|import-fixture|smoke-stage0|eval-rag|sync-zotero|sync-status|purge-lifecycle> [flags]")
 	}
 	command := os.Args[1]
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -38,6 +38,9 @@ func run() error {
 	fixturePath := fs.String("fixture", env("RS_ZOTERO_FIXTURE", "scripts/fixtures/zotero-stage0.yaml"), "fixture path")
 	datasetPath := fs.String("dataset", "", "golden dataset path")
 	kind := fs.String("kind", "all", "eval kind: all, retrieval, brief")
+	syncMode := fs.String("mode", "full", "sync mode: full or incremental")
+	libraryID := fs.String("library-id", env("ZOTERO_LIBRARY_ID", ""), "Zotero user/library id (optional)")
+	apiKeyFile := fs.String("api-key-file", env("ZOTERO_API_KEY_FILE", ""), "path to a chmod 600 file holding the Zotero API key")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -46,7 +49,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	timeout := 2 * time.Minute
+	switch command {
+	case "sync-zotero", "purge-lifecycle":
+		// Zotero free-tier rate limits force serialized, backed-off requests.
+		timeout = 45 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	store, err := storage.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -94,6 +103,27 @@ func run() error {
 			return fmt.Errorf("RAG hard gates failed: %s", strings.Join(result.Report.HardGateFailures, "; "))
 		}
 		return printJSON(map[string]any{"report_path": result.ReportPath, "report": result.Report}, nil)
+	case "sync-zotero":
+		if _, err := store.Migrate(ctx, *migrationsDir); err != nil {
+			return err
+		}
+		if err := storage.SeedLocal(ctx, store, cfg.DevActorID, cfg.DevWorkspaceID); err != nil {
+			return err
+		}
+		result, err := runSyncZotero(ctx, store, cfg, syncFlags{mode: *syncMode, libraryID: *libraryID, apiKeyFile: *apiKeyFile})
+		return printJSON(result, err)
+	case "sync-status":
+		if _, err := store.Migrate(ctx, *migrationsDir); err != nil {
+			return err
+		}
+		result, err := runSyncStatus(ctx, store, cfg, *libraryID)
+		return printJSON(result, err)
+	case "purge-lifecycle":
+		if _, err := store.Migrate(ctx, *migrationsDir); err != nil {
+			return err
+		}
+		result, err := runPurgeLifecycle(ctx, store, cfg)
+		return printJSON(result, err)
 	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
