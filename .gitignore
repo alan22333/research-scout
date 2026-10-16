@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+config.local.yaml
+config.local.*
+*.log
+tmp/
+dist/
+build/
+node_modules/
+.swiftpm/
+DerivedData/
+xcuserdata/
