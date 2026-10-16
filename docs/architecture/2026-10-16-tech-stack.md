@@ -1,680 +1,593 @@
-# Research Scout 技术方案设计：技术栈与系统架构
+# Research Scout 架构基线 v1.1：Zotero Web API-first
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | v0.1 |
-| 状态 | 技术方向建议，待评审 |
+| 文档版本 | v1.1 |
+| 状态 | 架构基线冻结；模块设计已展开，变更需 ADR |
 | 日期 | 2026-10-16 |
 | 关联 PRD | [`docs/prd/2026-10-16-zotero-research-assistant-prd.md`](../prd/2026-10-16-zotero-research-assistant-prd.md) |
-| 目标 | 确定 v1 的技术栈大方向、系统边界和部署形态，为原型与实现排期提供基线 |
-| 非范围 | 具体 HTTP 请求体、完整数据库字段、供应商最终合同和 UI 视觉规范 |
+| 目标 | 冻结 v1 系统边界、技术栈、Zotero 接入边界、数据与部署方向；技术细节见设计包 |
+| 非范围 | UI 视觉规范、Connector 协议、OAuth 实现；字段、接口和模块细节见 [`docs/design/`](../design/README.md) |
+| v1 Zotero 路径 | Zotero Web API，仅个人 My Library |
+| v1 客户端 | Web 应用；Connector 不进入 v1 实现和验收 |
 
 ---
 
 ## 1. 决策摘要
 
-### 1.1 一句话技术定义
+### 1.1 一句话架构定义
 
-Research Scout v1 采用 **Go 模块化单体 + PostgreSQL/pgvector + React/Vite Web + 原生 SwiftUI macOS Connector**，通过 Lab Nexus 联邦身份登录，在单台 Linux 主机上以 Docker Compose 部署；Zotero Local API 只提供派生全文，原始 PDF 永不进入服务端。
+Research Scout v1 采用 **Go 模块化单体（API + Worker）+ PostgreSQL/pgvector + React/Vite Web**，通过服务端代理 Zotero Web API，将用户个人 My Library 的元数据和可用 fulltext 增量索引为可追溯证据，并在项目级 collection scope 内执行三档检索与有界 RAG；Connector 仅保留为未来可能增加的可选本地读入实现。
 
-### 1.2 建议技术栈
+### 1.2 基线决策
 
-| 层 | 推荐选型 | 选择理由 |
+| 领域 | v1 决策 | 理由 |
 |---|---|---|
-| 仓库组织 | 单仓库、多交付物 | Web、API、Connector、契约和部署配置需要同步演进，v1 不需要拆仓 |
-| Web | React 19 + TypeScript + Vite + React Router 7 | 与 Lab Nexus 正式前端一致，适合登录后工作台和复杂异步状态 |
-| Web 数据层 | TanStack Query + 原生 fetch；Zod 校验边界数据 | 服务端状态、缓存、重试和流式任务状态清晰，不引入 Redux |
-| UI | Tailwind CSS v4 + shadcn/ui（Radix 基座） | 与 Lab Nexus 设计体系一致，组件源码可维护 |
-| API | Go 1.25 + Gin | 与 Lab Nexus 技术栈一致；适合并发同步、任务编排和单二进制部署 |
-| 数据访问 | pgx/v5 + sqlc | 检索、过滤、向量查询和租户隔离需要显式 SQL，避免把关键查询绑死在 ORM |
-| 迁移 | Goose | 版本化、可审计，和 Go 单仓协作简单 |
-| 主数据库 | PostgreSQL 16 + pgvector | 事务、全文、向量、任务状态和审计集中在一个可靠存储中 |
-| 检索 | PostgreSQL FTS + pgvector HNSW + RRF + reranker adapter | v1 规模不需要独立搜索引擎或向量数据库 |
-| 后台任务 | 同一 Go 代码库的 worker 进程；PostgreSQL-backed durable queue（首选 River） | 任务与业务数据同事务，减少 Redis/Kafka 运维面 |
-| 流式交互 | HTTP REST + Server-Sent Events（SSE） | 问答和同步进度是单向流；比 WebSocket 简单、可穿透常见代理 |
-| 接口契约 | OpenAPI 3.1 + 单独 SSE 事件契约 | 同时服务 Web、Connector 和测试；契约先行，减少跨端漂移 |
-| 身份认证 | Lab Nexus OIDC Authorization Code + PKCE；Research Scout 自己维持会话 | 不共享密码、不直连 Lab Nexus 数据库、不跨应用复用长期 JWT |
-| Connector | Swift 6 + SwiftUI + URLSession + Keychain + Sparkle | 原生 macOS 体积小、签名/公证/自动更新路径成熟，最适合只读 Local API |
-| LLM/Embedding | Provider adapter；默认 OpenAI-compatible 接口，国内部署优先评估 DashScope/Qwen | 模型迭代快，必须把供应商和模型版本从领域模型中解耦 |
-| Agent 编排 | Go 内实现有界状态机，不引入 LangChain/LlamaIndex 作为核心运行时 | 工具权限、步数、成本和证据链必须可预测、可测试 |
-| 部署 | 单 VM + Docker Compose + Caddy；Web 静态文件同域提供 | 3–5 人试点无需 Kubernetes；备份、升级和排障成本最低 |
-| 可观测性 | `log/slog` JSON + Prometheus 指标 + OpenTelemetry trace | 能追踪同步、检索、外部调用和生成链路，同时不记录私人全文 |
-| 测试 | Go test + testcontainers + Playwright + XCTest + 检索 golden set | 覆盖 API、真实 Postgres、Web、Connector 和证据质量 |
+| 架构形态 | 模块化单体，同仓多交付物 | 3–5 人试点不需要微服务；共享事务和领域边界更重要 |
+| 服务端 | Go 1.25 + Gin | 适合同步、任务、检索编排和单二进制部署，并与现有技术经验一致 |
+| 数据访问 | GORM；复杂全文/向量 SQL 封装在 repository | 统一事务与开发速度；不引入 pgx/sqlc 双轨 |
+| 数据库 | PostgreSQL 16 + pgvector | 元数据、任务、审计、FTS 和向量集中在一个事务边界 |
+| 迁移 | Goose | 版本化迁移简单可审计 |
+| Web | React 19 + TypeScript + Vite + React Router 7 | 登录后工作台，无 SSR/SEO 刚需，构建边界清晰 |
+| Web 数据层 | TanStack Query + 原生 fetch | 服务端状态、轮询、缓存和 SSE 状态易于管理 |
+| UI | Tailwind CSS + shadcn/ui 方向 | 组件源码可控，适合快速形成内部工作台 |
+| API 契约 | OpenAPI 3.1 + REST + SSE | Web 与未来 Connector 均可复用；流式进度使用 SSE |
+| 后台任务 | PostgreSQL-backed durable queue，首选 River | 任务与业务数据同事务，不先引入 Redis/Kafka |
+| Zotero 接入 | `ZoteroSource` 领域边界；v1 仅实现 `WebAPISource` | 隔离来源差异，未来 Connector 只能成为另一实现 |
+| Zotero 范围 | 个人 My Library；v1 不支持 group libraries | 权限、同步和产品边界最清晰 |
+| Zotero 同步 | 按需 + 手动刷新；library version + `?since=` 增量 | 不引入 Webhook 和定时全量轮询，降低试点复杂度 |
+| Zotero 凭据 | Go 服务端加密保存并代理调用；开发期只读 API Key，试点前 OAuth 1.0a | 浏览器不持有长期 Key，调用和撤权集中治理 |
+| 证据类型 | `personal_fulltext`、`structured_abstract`、`web_context` | 个人全文优先；摘要降级；网页只提供背景 |
+| 检索模式 | `my_library`、`gap_fill`、`landscape` | 用户明确选择范围和外部来源权限 |
+| 外部来源 | Semantic Scholar + OpenAlex；原生联网搜索仅全景模式 | 结构化发现优先；网页只提供背景，不单独支撑科学结论 |
+| LLM/Embedding | OpenAI 兼容 Provider；默认 Qwen/DashScope | 默认 `qwen-plus`、1024 维 Qwen Embedding、`qwen3-rerank`，均可替换 |
+| Agent | Go 内有界状态机，不使用自由 Agent 循环 | 成本、权限、证据和失败路径可测试 |
+| 身份 | v1 独立开发；不接 Lab Nexus、不实现 OIDC | 身份不是当前关键路径；保留 `actor_id`/`workspace_id` 适配边界 |
+| 本地验证 | PostgreSQL 容器 + Go/Web 原生运行 | 聚焦集成调试，降低开发环境复杂度 |
+| 部署方向 | 单机 Linux + Docker Compose + Caddy | 试点规模不需要 Kubernetes；公网部署不阻塞当前开发 |
+| 可观测性 | JSON 日志 + Prometheus 指标 + OpenTelemetry trace | 追踪同步、检索和外部调用，同时避免记录完整私人全文 |
 
-### 1.3 已被否决的替代方向
+### 1.3 已明确否决
 
-| 替代方案 | 不采用原因 |
+| 替代方向 | 否决原因 |
 |---|---|
-| 微服务 / Kubernetes | v1 只有 3–5 名用户，跨服务事务、部署和排障成本远高于收益 |
-| 独立 Qdrant/Milvus | 删除一致性、权限过滤和事务边界更复杂；pgvector 足够支撑试点 |
-| Elasticsearch/OpenSearch | 当前规模和检索需求不需要额外有状态服务 |
-| Redis/Kafka 作为任务队列 | PostgreSQL 可提供足够的持久任务队列能力，减少一套生产依赖 |
-| Next.js | 产品是登录后工作台，无 SEO/SSR 刚需；Vite 与 Lab Nexus 前端更一致 |
-| Electron Connector | 资源占用和签名链路更复杂；v1 仅 macOS，SwiftUI 更合适 |
-| 直接把 Lab Nexus JWT 给 Research Scout | 跨域会话、权限爆炸半径、设备凭据和撤权都无法清晰治理 |
-| 直接把论文摘要作为中央语料 | 已被产品决策淘汰；个人 Zotero 全文才是首要证据层 |
-| 自由 ReAct/无限 Agent 循环 | 成本、时延、工具越权和不可复现性不可接受 |
-| 自行抓取全文 PDF | 法务、解析、存储和版权风险高；Local API 已能提供 Zotero 的派生全文 |
+| v1 强制安装 macOS Connector | Local API 只存在于用户机器；先引入安装、签名、公证、更新和配对，会显著扩大首版闭环 |
+| 浏览器直接访问 Zotero Local API | 本地 API 的 Origin 行为和跨源限制不可控，也不适合集中部署 |
+| 把 Local API demo 当作线上接入方案 | demo 证明本地读取可行，没有解决公网服务访问用户本机的问题 |
+| Lab Nexus 强制 OIDC | 两边都在开发中，接口尚未稳定；v1 不应把身份集成变成阻塞项 |
+| 浏览器持久化 Zotero API Key | 泄露面、撤权和审计边界不可接受 |
+| pgx + sqlc | 增加一套与 GORM 并行的数据访问方式，收益不足以抵消复杂度 |
+| Redis/Kafka、独立向量库、Elasticsearch | 当前规模可由 PostgreSQL 承担，减少有状态依赖 |
+| Connector、PDF 解析、批注/笔记索引进入 v1 | 不是验证“个人文库 + 外部发现 + 简报”价值的必要路径 |
+| Tavily/Brave/自建爬虫作为默认联网方案 | 主流模型已有原生搜索 grounding；先复用能力，失败时显式降级 |
+| 开发者维护新的中央语料库 | 版权、全文获取、存储和覆盖责任不可控，已由产品方向排除 |
 
 ---
 
-## 2. 现有事实与设计约束
+## 2. 背景、事实与约束
 
-### 2.1 Lab Nexus
+### 2.1 Local API demo 的结论
 
-已核验的 Lab Nexus 现状：
+本地原型已经验证：
 
-- 后端：Go 1.25、Gin、GORM、PostgreSQL 16、Redis 7。
-- 认证：用户名密码 + 15 分钟 JWT access token + Redis 中 30 天 refresh token。
-- 角色：`admin | supervisor | student`。
-- 前端：React 19、Vite、TypeScript、Tailwind v4、shadcn/ui、React Router 7。
-- 当前没有 OIDC/OAuth Provider，也没有明确的组织/租户表；个人空间 `space` 不等于租户。
+- Zotero 桌面端可以提供 collection、item 元数据和 fulltext。
+- 一个运行在用户 Mac 上的本地进程可以代理 `http://localhost:23119`，解决浏览器直连时的跨源和 Origin 问题。
+- 因此，Local API 可以作为未来 Connector 的技术基础。
 
-因此“复用 Lab Nexus 登录”不能解释为直接共享现有 access/refresh token。技术设计采用联邦身份：
+但本地原型同时证明：
 
-1. Lab Nexus 增加 OIDC Provider。
-2. Research Scout 是 OIDC Client。
-3. Research Scout 建立自己的服务端会话和本地用户投影。
-4. 角色通过受签名 claim 同步；Research Scout 再做最小权限映射。
-5. Connector 通过 PKCE 完成用户授权后，获得 Research Scout 签发的设备级凭据。
+- `localhost:23119` 只在用户电脑上存在。
+- 集中部署的公网服务无法访问用户的 loopback 地址。
+- 浏览器直连 Local API 受到跨源、Private Network Access 和 Origin 行为约束。
+- 要让服务端读取本地-only 内容，必须额外开发、分发和维护一个 Connector。
 
-这是一个**阻塞生产部署、但不阻塞原型骨架**的前置技术项。原型阶段可使用开发身份模拟器；正式接入必须完成 OIDC 或等价的标准授权桥。
+**架构结论**：Local API demo 是 Connector 原型，不是 v1 的集中部署路径。本期不开发 Connector，不设计设备配对、安装包、签名、公证、自动更新或本地同步协议。
 
-### 2.2 Zotero Local API
+### 2.2 Zotero Web API 的 v1 边界
 
-依据 Zotero 官方文档：
+v1 使用官方 Zotero Web API：
 
-- Local API 基址为 `http://localhost:23119/api/`。
-- 读请求无需认证，但用户必须在 Zotero 设置中允许本机应用通信。
-- Local API 只提供当前本机登录用户的数据；个人库可使用 `/users/0/`。
-- `GET /users/0/fulltext?since=<version>` 可增量列出全文发生变化的 attachment。
-- `GET /users/0/items/<itemKey>/fulltext` 可读取 attachment 的派生全文、索引页数等。
-- Local API 默认不分页；`limit/start` 和 `since` 仍可用。
-- Zotero 10+ 使用本地 server ID 和本地对象版本；同步游标必须按 server ID 分区。
-- Local API 不应被转发或暴露到外部网络。
-- v1 只做读请求，不申请 Zotero 写授权。
+- 基址：`https://api.zotero.org`
+- API 版本头：`Zotero-API-Version: 3`
+- 认证：服务端使用用户授权的只读凭据调用
+- 分页：每页最多 100，使用 `Link`/`Total-Results` 读取完整集合
+- 限流：遵守 `429`、`Retry-After` 和 `Backoff`，并发不超过 4
+- 增量：使用 library version、`?since=` 和 `format=versions` 获取变更
+- 删除：读取 deleted 数据并在本地建立 tombstone
+- 全文：尝试读取 Zotero 服务端可用的 fulltext；附件没有可用全文时按正常缺省处理
 
-直接结论：**v1 不需要服务端 PDF 解析器，也不上传 PDF。** Connector 获取 Zotero 已抽取的全文；若某篇 PDF 没有本地全文索引，则标记为 `fulltext_unavailable`，不尝试上传原文件或静默伪造全文。
+必须明确的产品事实：
 
-参考：
-
-- <https://www.zotero.org/support/dev/web_api/v3/local_api>
-- <https://www.zotero.org/support/dev/web_api/v3/fulltext_content>
+- Web API 只覆盖已经同步到 `zotero.org` 的数据。
+- 题录同步不等于 PDF 或 fulltext 一定同步。
+- 本地-only 文献、未同步附件和 Zotero 服务端无 fulltext 的条目属于已知缺口。
+- 系统不得把摘要或元数据伪装成 `personal_fulltext`。
+- 全文缺失不阻断条目同步、元数据检索和摘要级回答。
 
 ### 2.3 产品与规模约束
 
-- v1 目标用户为 3–5 人，真实规模有限。
-- 首要数据是按用户、workspace、collection 隔离的全文。
-- 删除必须“立即退出检索、30 天后物理清除”，单数据库更容易保证一致性。
-- 外部来源失败不得阻断个人文库模式。
-- 回答必须显示过程、证据层和引用，不展示隐藏推理。
-- 原始 PDF、批注和私人笔记不进入服务端。
+- v1 目标用户是 3–5 名信息安全课题组学生与教师。
+- 使用方式是公网 HTTPS Web 应用，用户无需安装桌面客户端。
+- 每个人只访问自己的 workspace、项目、Zotero 连接和派生索引。
+- 不保存 PDF 二进制；不提供 PDF 上传；不解析 PDF；不索引 Zotero 批注和笔记。
+- 外部模型只处理检索命中的必要片段，并受首次知情同意和日志脱敏约束。
 
 ---
 
 ## 3. 系统上下文
 
-```mermaid
-flowchart LR
-    U[用户浏览器] -->|HTTPS| C[Caddy / Web 静态文件 / API 反向代理]
-    C --> W[React Web]
-    C --> A[Go API]
-    M[macOS Connector] -->|只读 localhost:23119| Z[Zotero Local API]
-    M -->|HTTPS + 设备凭据| A
-    A --> P[(PostgreSQL + pgvector)]
-    A --> Q[PostgreSQL Job Queue]
-    Q --> K[Go Worker]
-    K --> P
-    K --> S2[Semantic Scholar]
-    K --> OA[OpenAlex]
-    K --> LLM[LLM / Embedding Provider]
-    K --> WS[Web Search Provider]
-    A -->|OIDC Authorization Code + PKCE| L[Lab Nexus]
+```text
+                         ┌──────────────────────────┐
+                         │      React/Vite Web      │
+                         │ 工作台 / 会话 / 简报 / 设置 │
+                         └────────────┬─────────────┘
+                                      │ HTTPS REST + SSE
+                         ┌────────────▼─────────────┐
+                         │   Research Scout Core    │
+                         │ Go API + Worker（单体）    │
+                         │ 身份适配 / 项目 / Agent    │
+                         └───┬────────┬────────┬────┘
+                             │        │        │
+                 ┌───────────▼──┐ ┌───▼────┐ ┌▼──────────────┐
+                 │ PostgreSQL   │ │ Zotero │ │ External       │
+                 │ + pgvector   │ │ Web API│ │ Providers      │
+                 │ 业务/任务/索引 │ │        │ │ S2/OpenAlex/Web │
+                 └──────────────┘ └───┬────┘ └────────────────┘
+                                      │
+                         ┌────────────▼─────────────┐
+                         │ 用户已同步的个人文库       │
+                         │ My Library，非 group      │
+                         └──────────────────────────┘
+
+未来可选扩展（不在 v1 接口和排期中）：
+[Local Connector] ──> 同一 ZoteroSource 边界
 ```
 
 ### 3.1 运行时单元
 
-| 单元 | 职责 | 不做的事 |
+| 单元 | 职责 | v1 形态 |
 |---|---|---|
-| Web | 工作台、项目、scope 选择、过程流、简报、历史、审计查看 | 不直接访问数据库，不保存长期设备凭据 |
-| API | 身份会话、授权、CRUD、任务入队、SSE、文件上传边界 | 不执行长时间同步或生成 |
-| Worker | Zotero 派生数据入库、chunk、embedding、外部检索、RAG 编排、生成、清理任务 | 不绕过 API 的权限模型 |
-| Connector | 发现 collection、读取 Local API、增量上传派生文本、设备健康检查 | 不运行 RAG、不持有 LLM key、不监听入站端口 |
-| PostgreSQL | 元数据、全文、分块、向量、项目、会话、任务、审计、删除状态 | 不保存 PDF 二进制 |
-| Caddy | TLS、静态 Web、反向代理、SSE 缓冲控制 | 不承载业务逻辑 |
+| Web | 登录占位、工作台、提问、过程、简报、设置 | React 静态资源 |
+| API | 鉴权占位、项目、连接、查询、同步控制、审计 | Go 进程 |
+| Worker | Zotero 同步、索引、embedding、外部发现、简报任务 | 同仓 Go 进程 |
+| PostgreSQL | 业务数据、任务、FTS、向量、审计、生命周期 | 容器 |
+| Zotero Web API | 个人文库事实源 | 外部服务 |
+| Provider adapters | S2、OpenAlex、联网搜索、LLM、Embedding | 外部服务 |
+
+API 与 Worker 共享领域模块和数据库，不共享进程内状态。它们可以部署为同一镜像的两个启动模式。
 
 ---
 
-## 4. 架构原则
+## 4. 模块边界
 
-1. **模块化单体优先**：按领域包组织，不按服务拆网。只有当某一模块有独立扩容或故障隔离证据时才拆服务。
-2. **PostgreSQL 是唯一事实源**：全文、向量、任务、审计和删除状态不散落到多个有状态系统。
-3. **契约先行**：OpenAPI 和 SSE 事件类型先于控制器实现修改。
-4. **证据先于生成**：LLM 只能消费已被工具检索、归一化、带 provenance 的证据包。
-5. **有界 Agent**：Planner 可以建议下一步，但不允许无限循环和静默扩权。
-6. **租户与用户隔离是数据模型的一等约束**：所有业务表都带 workspace/user scope。
-7. **Connector 最小权限**：只读 Zotero；不上传 PDF；设备凭据可单独撤销。
-8. **模型和外部来源可替换**：领域层不出现供应商 SDK 类型。
-9. **删除可证明**：任何删除任务都有状态、审计记录和最终校验。
-10. **先做单机可运维性**：试点阶段优先备份、恢复、日志和升级，而非理论横向扩展。
+### 4.1 Identity/Workspace Shell
 
----
+v1 不接 Lab Nexus、不实现 OIDC。开发期使用可替换的身份适配器：
 
-## 5. 组件设计
+- `actor_id`：当前用户或服务身份。
+- `workspace_id`：数据与授权边界。
+- `role`：普通用户或显式系统管理员。
+- 所有查询和写入必须由服务端注入这些边界，不能信任前端传入。
 
-### 5.1 API 进程
+未来接入 Lab Nexus 或其他 IdP 时，只替换身份适配器，不改变业务对象和授权检查位置。
 
-建议使用薄的 Gin 路由层，业务逻辑放在 `internal/<domain>`：
+### 4.2 Zotero 模块
 
-```text
-HTTP Handler -> Application Service -> Repository / Adapter
-```
+定义统一领域边界 `ZoteroSource`：
 
-关键领域模块：
+- 描述连接和可访问文库。
+- 列出 collection 及层级。
+- 读取 library 当前版本和增量变更。
+- 读取 item/attachment 元数据。
+- 读取服务端可用 fulltext。
+- 返回规范化错误，不把供应商错误泄漏到领域层。
 
-- `identity`：OIDC、会话、角色映射、设备授权。
-- `workspace`：workspace 和租户边界。
-- `connector`：设备注册、同步会话、幂等批次、游标。
-- `zotero`：collection/item/attachment/fulltext 的规范化模型。
-- `library`：文档、版本、分块、embedding、索引状态。
-- `project`：研究项目、默认 scope、保存 scope。
-- `query`：查询会话、模式、任务状态、SSE 事件。
-- `evidence`：证据归一化、分层、引用锚点。
-- `brief`：结构化简报、缺口、历史快照。
-- `discovery`：Semantic Scholar、OpenAlex、Web Search 适配器。
-- `audit`：管理员访问和敏感操作记录。
-- `lifecycle`：删除、保留期、清理和一致性校验。
+v1 唯一实现是 `WebAPISource`。未来 Connector 只能是另一个实现，不改变 `IndexedDocument`、`Evidence` 和同步任务语义。
 
-`pgx + sqlc` 用于所有关键读写。GORM 不进入 Research Scout 的数据层，避免在复杂检索和 pgvector 查询中引入隐式行为；这不影响复用 Lab Nexus 的 Gin 和目录组织经验。
+### 4.3 同步与索引模块
 
-### 5.2 Worker 进程
+职责：
 
-Worker 与 API 共用仓库、领域模型和配置，但独立运行二进制。首批任务类型：
+- 管理连接、同步游标、重试和覆盖状态。
+- 规范化 Zotero item、attachment、collection 关系。
+- 计算内容 hash，执行版本化写入。
+- 生成 chunk 和 embedding。
+- 产出 `personal_fulltext` 或 `structured_abstract` 证据状态。
+- 处理 tombstone、重命名、移动和删除。
 
-- `connector.sync_collection`
-- `document.index`
-- `document.reindex`
-- `query.run`
-- `discovery.enrich`
-- `brief.generate`
-- `lifecycle.purge`
-- `embedding.rebuild`
+### 4.4 检索与证据模块
 
-任务要求：
+职责：
 
-- 幂等键由 workspace、用户、Zotero server ID、对象 key 和内容版本组成。
-- 状态分为 `queued | running | retry_wait | succeeded | failed | canceled`。
-- 重试使用有上限的指数退避，并记录下一次重试时间。
-- 每个外部调用记录 provider、延迟、结果状态和费用元数据；不记录全文。
-- 用户可见的任务进度至少每 5 秒写入一次状态。
+- 强制应用 workspace、用户、项目、collection scope、tombstone 和版本过滤。
+- 执行 PostgreSQL FTS、pgvector HNSW 和 RRF 融合。
+- 按需调用 reranker adapter。
+- 将候选组织为带来源、版本和定位信息的 `Evidence`。
+- 对结果执行去重、冲突标记和证据充分性判断。
 
-### 5.3 Web
+### 4.5 Agent/QuerySession 模块
 
-Web 采用现有 Lab Nexus 前端技术栈，但不复制其业务代码。
-
-- 路由：React Router 7。
-- 服务端状态：TanStack Query。
-- 表单：React Hook Form + Zod。
-- 全局状态：默认不引入 Redux；URL 保存 mode/scope/project，局部状态留在组件内。
-- 认证：依赖 Research Scout `HttpOnly + Secure + SameSite` 会话 Cookie，不把 access token 存入 `localStorage`。
-- 实时：使用 `EventSource` 或 fetch streaming 消费 SSE；断线后按 `Last-Event-ID` 恢复。
-- 页面：项目工作台、连接与覆盖、提问、会话过程、简报、历史、审计记录、管理员设置。
-
-### 5.4 macOS Connector
-
-推荐栈：
-
-| 维度 | 方案 |
-|---|---|
-| 语言/UI | Swift 6 + SwiftUI 菜单栏应用 |
-| 网络 | `URLSession`，本机 HTTP 仅访问 `127.0.0.1:23119` |
-| 凭据 | Keychain 保存 Research Scout 设备 token；不保存 Lab Nexus 密码 |
-| 登录 | 系统浏览器 Authorization Code + PKCE，回调后由服务端换发设备凭据 |
-| 常驻 | 登录时启动与菜单栏状态；使用系统 `ServiceManagement` |
-| 自动更新 | Sparkle 2 + 签名 appcast；仅从正式 GitHub Release 源更新 |
-| 分发 | Developer ID 签名 + Apple 公证的 `.dmg` 或 `.pkg` |
-| 最低版本 | 待技术 spike 确认；建议以 macOS 14 为初始基线，Zotero 以当前稳定版为验证范围 |
-
-Connector 同步流程：
-
-1. 探测 Zotero 是否运行、Local API 是否启用和 API version。
-2. 读取用户可选的 collection 树；不上传未授权内容。
-3. 使用 `server_id` + `since` 读取增量对象和变更全文。
-4. 获取 item 元数据与 attachment fulltext。
-5. 在本地计算内容哈希、压缩批次、带上幂等键上传。
-6. 保存服务端返回的游标与失败清单。
-7. 对单篇失败继续处理，不中断整个 collection。
-8. 网络失败进入退避和安全恢复；不开放任何入站端口。
-
-### 5.5 外部适配器
-
-每个供应商通过边界 interface 接入：
-
-- `ScholarlyDiscovery`：Semantic Scholar、OpenAlex。
-- `SearchProvider`：通用联网搜索。
-- `LLMProvider`：生成、结构化输出、可选 rerank。
-- `EmbeddingProvider`：向量化。
-- `Reranker`：候选重排。
-
-适配器约束：
-
-- 归一化到内部 `Work`、`Document`、`Chunk`、`Evidence` 类型。
-- 外部 ID 和 provider 名必须随结果保留。
-- 冲突结果同时保留，不静默覆盖。
-- 供应商限流、超时和降级由适配器统一处理。
-- 供应商原始响应若需缓存，只保留合规字段，不长期保存网页全文。
-
----
-
-## 6. 数据与检索架构
-
-### 6.1 状态边界
-
-| 数据 | v1 存储位置 | 说明 |
-|---|---|---|
-| 原始 PDF | 用户本机 Zotero | 服务端和 Connector 上传链路都不包含 PDF 二进制 |
-| Zotero 标识和元数据 | PostgreSQL | item、attachment、collection、server ID、版本 |
-| Zotero 派生全文 | PostgreSQL `text` | 试点规模足够；未来再评估对象存储 |
-| Chunk | PostgreSQL | 保留文档、版本、序号、section/page（若有）和哈希 |
-| Embedding | PostgreSQL + pgvector | 记录 provider、model、维度、版本和时间 |
-| 查询/简报/审计 | PostgreSQL | 用户可删除，管理员审计有独立日志 |
-| 原始网页 | 不长期保存 | 仅保留引用所需的 URL、标题、抓取时间和短片段 |
-
-v1 不引入 S3/MinIO、不建独立向量库。若数据量或恢复目标出现实测瓶颈，再以 ADR 评估对象存储和外置向量服务。
-
-### 6.2 索引流水线
-
-```text
-Collection 选择
-  -> 增量发现
-  -> item / attachment 元数据归一化
-  -> fulltext 读取与 hash
-  -> 结构感知 chunk
-  -> embedding
-  -> 校验与发布
-  -> 覆盖状态可见
-```
-
-关键规则：
-
-- 文档发布采用版本化写入，避免半索引状态进入检索。
-- 内容 hash 未变化时不重新 embedding。
-- embedding model 或版本变化时建立新向量版本，不在原向量上静默覆盖。
-- 找不到 fulltext 时保留元数据和索引状态，不伪造正文。
-- collection 取消授权或条目删除时立即设置不可检索 tombstone。
-- 30 天清理任务最终物理删除全文、chunk、向量和派生缓存。
-
-### 6.3 混合检索
-
-推荐检索顺序：
-
-1. 强制应用 workspace、用户、collection scope、tombstone 和版本过滤。
-2. PostgreSQL FTS 检索标题、元数据和 chunk 精确词。
-3. pgvector HNSW 检索语义近邻。
-4. 使用 RRF 融合关键词与向量排名。
-5. 使用 reranker 对候选重排。
-6. 组装带文档、chunk、页码/位置和来源层的证据包。
-7. 生成回答后执行引用完整性与证据覆盖校验。
-
-不建议首发 Elasticsearch、Qdrant 或独立 rerank 服务。只有出现明确的规模、延迟或检索质量瓶颈时才通过 ADR 引入。
-
-### 6.4 三种模式的工具权限
-
-| 模式 | 个人全文 | S2/OpenAlex | 联网搜索 | 输出 |
-|---|:---:|:---:|:---:|---|
-| `my_library` | ✓ |  |  | 个人文库问答与综合 |
-| `gap_fill` | ✓ | ✓ |  | 库内外对照、找漏 |
-| `landscape` | ✓ | ✓ | ✓ | 全景简报，网页仅作低层级上下文 |
-
-工具权限由服务端根据模式强制，而不是由前端或 LLM 自行决定。
-
----
-
-## 7. 有界 RAG Agent
-
-### 7.1 为什么不采用自由 Agent 循环
-
-自由规划和循环工具调用难以控制：
-
-- 延迟和 token 成本不可预测。
-- 工具越权难以审计。
-- 错误路径难以复现和评测。
-- 用户无法判断某结论是否真的由证据支持。
-
-因此 agent 采用显式状态机，并为每一步设置预算和终止条件：
+采用有界状态机：
 
 ```text
 受理
- -> 意图/模式校验
- -> 检索计划
+ -> 意图与模式校验
+ -> SearchPlan
  -> 工具执行
  -> 结果归一化与去重
- -> 证据选择
- -> 重排
+ -> 证据选择与重排
  -> 简报生成
- -> 引用校验
+ -> 引用与证据校验
  -> 持久化与完成
 ```
 
-### 7.2 运行时约束
+工具权限由服务端根据模式强制：
 
-- 最大计划步骤、最大工具调用次数、最大 token 和墙钟时间都配置化。
-- 每次工具调用写入可审计事件。
-- LLM 输出使用 JSON Schema/结构化输出；无法解析时降级为基于证据的模板化回答。
-- 生成模型只接收必要证据和明确指令，不接收整个私人文库。
-- 关键结论必须绑定 evidence ID；校验失败时可重新生成或标记证据不足。
-- 不向前端输出 chain-of-thought；只输出计划、阶段、工具、来源和证据摘要。
-- 所有 prompt 和模型版本进入版本记录，支持回放和回归评测。
+- `my_library`：只允许个人文库检索。
+- `gap_fill`：个人文库 + S2/OpenAlex。
+- `landscape`：个人文库 + S2/OpenAlex + 联网搜索。
 
-### 7.3 模型策略
+Agent 可以建议升级模式，但必须由用户确认，不能静默扩大范围。
 
-模型和 embedding provider 通过配置选择：
+### 4.6 外部来源模块
 
-- 生产优先选择支持中文/英文和稳定结构化输出的供应商。
-- 如果部署在中国大陆，优先评估 DashScope/Qwen 等可达服务；OpenAI-compatible 接口作为备用路径。
-- Embedding 维度、距离函数和模型名必须写入索引元数据。
-- 不把模型名称、API key 或供应商响应结构硬编码到领域模型。
-- 是否允许数据出境由部署配置和组织政策决定；UI 必须展示实际使用的供应商类别。
+统一适配边界：
 
----
+- `ScholarlyDiscoverySource`：Semantic Scholar、OpenAlex。
+- `WebSearchProvider`：模型供应商原生联网搜索或未来独立搜索实现。
+- `LLMProvider`：生成、结构化输出和可选重排。
+- `EmbeddingProvider`：向量化。
 
-## 8. 身份、权限与安全
+v1 首个联网实现是 `QwenNativeWebSearch`。未支持原生搜索时返回 `web_search_unavailable`，不静默依赖第三方搜索。外部结果必须归一化到内部 `Work`、规范化论文标识和 `Evidence`。供应商 ID、DOI、年份、venue、原始 URL 和获取时间必须保留。
 
-### 8.1 目标认证流
+### 4.7 生命周期与审计模块
 
-```mermaid
-sequenceDiagram
-    participant B as Browser
-    participant R as Research Scout
-    participant L as Lab Nexus OIDC
-    B->>R: 打开登录
-    R->>B: 重定向至 Lab Nexus + PKCE
-    B->>L: 登录/授权
-    L->>R: authorization code
-    R->>L: 换取 ID Token / UserInfo
-    L-->>R: sub, name, roles, issuer
-    R->>R: 建立本地用户投影和服务端会话
-    R->>B: HttpOnly Secure Session Cookie
-```
-
-Connector 使用系统浏览器完成同类 PKCE 流程；Research Scout 随后签发设备 token。Connector 只把设备 token 存入 Keychain，且该 token 可单独撤销。
-
-### 8.2 Lab Nexus 接入决策
-
-推荐方案：**在 Lab Nexus 增加 OIDC Provider。**
-
-最小 claim：
-
-- `iss`、`sub`、`aud`、`exp`、`iat`
-- `name` / `preferred_username`
-- `role`：`admin | supervisor | student`
-
-Role 映射：
-
-| Lab Nexus | Research Scout |
-|---|---|
-| `admin` | workspace auditor + 普通成员能力 |
-| `supervisor` | 普通成员（不自动获得审计权） |
-| `student` | 普通成员 |
-
-禁止方案：
-
-- 不共享 Lab Nexus 的 JWT secret。
-- 不直接读取 Lab Nexus 数据库。
-- 不把 password 或 refresh token 复制到 Research Scout。
-- 不把 `supervisor` 自动映射为管理员。
-
-若 OIDC 暂时无法完成，只允许开发环境使用 mock auth；生产不接受临时共享凭据。
-
-### 8.3 租户模型
-
-Lab Nexus 当前没有正式组织/租户表。Research Scout v1 采用：
-
-- 每次部署对应一个默认 workspace，同时所有业务表保留 `workspace_id`。
-- 未来接入多课题组时，从 OIDC issuer/client 或平台配置解析 workspace，不接受客户端任意声明。
-- 管理员永远只在所属 workspace 内拥有审计能力。
-- 所有查询必须有服务端注入的 workspace/user filter。
-
-### 8.4 安全控制
-
-- Web 使用 `HttpOnly + Secure + SameSite=Lax` 会话 Cookie 和 CSRF 防护。
-- Connector 使用设备级、可撤销、限权 token；服务端只保存 token hash。
-- 外部 API key、数据库密码和签名密钥只来自部署 secret，不进入前端或仓库。
-- 全链路 TLS。
-- 数据库卷启用磁盘加密；v1 不承诺端到端加密，因为服务端需要检索派生全文。
-- 审计管理员访问时要求重新认证，并记录 actor、时间、对象、原因和 request ID。
-- 日志和 trace 不记录完整全文；敏感字段在写入日志前脱敏。
-- 每个查询在检索前强制校验 workspace、user、collection 和 tombstone。
-- 对外部 URL 抓取必须防护 SSRF、重定向到内网和超大响应。
-- 删除任务同时清理关系数据、向量、缓存和可重建派生物。
+- 用户删除、撤权和主动清理进入统一生命周期流程。
+- 文档状态使用 `active | removed_pending_purge | purged`。
+- v1 使用明确的删除截止时间和可重试清理任务。
+- 管理员访问派生内容必须记录 actor、workspace、对象、原因、时间和请求标识。
+- 用户能看到与自己相关的管理员访问记录。
 
 ---
 
-## 9. 接口与契约
+## 5. 数据架构
 
-### 9.1 API 风格
+### 5.1 存储边界
 
-- REST + JSON，路径使用 `/api/v1` 和 `/connector/v1`。
-- OpenAPI 3.1 是接口事实源。
-- SSE 事件使用独立版本化 schema；事件至少包含 `event_id`、`session_id`、`type`、`sequence`、`occurred_at`、`payload`。
-- 异步操作返回 `202 + job_id`，状态通过查询或 SSE 获取。
-- 所有写操作支持 `Idempotency-Key`。
-- 错误响应使用稳定错误码，例如 `AUTH_REQUIRED`、`SCOPE_INVALID`、`SOURCE_DEGRADED`、`FULLTEXT_UNAVAILABLE`、`RATE_LIMITED`。
+| 数据 | v1 保存位置 | 服务端是否接收 PDF | 说明 |
+|---|---|---:|---|
+| Zotero 连接和凭据 | PostgreSQL，加密保存 | 否 | 服务端调用 Web API |
+| Zotero item/attachment 标识 | PostgreSQL | 否 | 追溯与幂等同步 |
+| 标准元数据 | PostgreSQL | 否 | 标题、作者、年份、venue、DOI 等 |
+| 服务端可用 fulltext | PostgreSQL `text` | 否 | 作为派生文本保存 |
+| Chunk | PostgreSQL | 否 | 保留文档、版本、序号和可用位置 |
+| Embedding | PostgreSQL + pgvector | 否 | 记录 provider、model、维度、版本 |
+| 查询、会话、简报 | PostgreSQL | 否 | 用户可见，可删除 |
+| 审计日志 | PostgreSQL | 否 | 独立访问记录 |
+| 原始网页 | 不长期保存 | 否 | 只保留引用所需 URL、标题、时间和短片段 |
+| 原始 PDF | 用户 Zotero | 否 | 产品不接收、不解析、不托管 |
 
-不建议 v1 使用 GraphQL 或 gRPC：当前交互以明确工作流为主，REST/OpenAPI 的跨语言和调试成本更低。
+v1 不引入对象存储。试点数据量和恢复目标若出现瓶颈，再通过 ADR 评估。
 
-### 9.2 主要接口域
+### 5.2 Zotero 同步算法
 
-- `/api/v1/auth/*`：登录跳转、回调、会话、登出。
-- `/api/v1/me`：用户投影和权限。
-- `/api/v1/devices/*`：设备注册、撤销、健康。
-- `/api/v1/connections/*`：Zotero 连接和 collection 覆盖。
-- `/api/v1/projects/*`：项目、scope、历史。
-- `/api/v1/sessions/*`：查询会话、SSE、取消和重试。
-- `/api/v1/briefs/*`：简报、引用、反馈。
-- `/api/v1/audit/*`：用户可见审计记录和管理员访问。
-- `/connector/v1/sync/*`：Connector 增量批次、游标、失败重传。
+1. 用户提交只读凭据或完成 OAuth 1.0a 授权。
+2. 服务端验证连接，读取个人 My Library 和 collection 树。
+3. 首次同步读取完整元数据、collection 关系和可用 fulltext。
+4. 后续同步读取 library version 和 `?since=` 变更。
+5. 对 Zotero 删除和连接撤权的对象建立 tombstone；项目/查询 scope 调整只改变过滤条件。
+6. 对内容 hash 变化的文档重新分块和 embedding。
+- 无 fulltext 但有摘要时保留 `structured_abstract` 证据；无摘要时标记 `metadata_only`。
+8. 每次同步记录游标、错误、成功数量和覆盖状态，支持断点续跑。
 
-生成客户端：
+关键约束：
 
-- Go 服务端从 OpenAPI 生成/校验请求类型。
-- TypeScript 使用生成类型，禁止手写一套漂移的接口模型。
-- Connector 可用 Swift Codable 模型，但由契约测试保证与 OpenAPI 一致。
+- 重复同步必须幂等。
+- 429 使用 `Retry-After`，无该头时指数退避。
+- 并发不超过 4。
+- 单个条目失败不阻断整个文库。
+- 不能把“未取得全文”写成同步失败或检索失败。
 
----
-
-## 10. 部署方案
-
-### 10.1 v1 拓扑
+### 5.3 索引流水线
 
 ```text
-Internet
-  |
-Caddy :443
-  |-- /            -> static web
-  |-- /api/*       -> api:8080
-  |-- /connector/* -> api:8080
-  |-- /events/*    -> api:8080 (SSE)
-  |
-api:8080  ---> postgres:5432
-worker    ---> postgres:5432
+Web API 连接
+  -> library/version 增量发现
+  -> item/attachment 元数据归一化
+  -> fulltext 可用性检查与 hash
+  -> 结构感知 chunk
+  -> embedding
+  -> 版本校验与发布
+  -> 覆盖状态更新
 ```
 
-Docker Compose 服务：
+- 文档只有完整发布后才进入检索。
+- hash 未变化时不重新 embedding。
+- 模型版本变化时创建新向量版本，不原地覆盖。
+- collection scope 只影响查询过滤，不复制出多份文档。
+- 同一论文出现在多个 collection 中时，只保留一个文档实体和多条 scope 关系。
 
-| 服务 | 说明 |
-|---|---|
-| `caddy` | TLS、静态 Web、反向代理、SSE 配置 |
-| `api` | Go HTTP API |
-| `worker` | Go 后台任务 |
-| `postgres` | PostgreSQL + pgvector，持久卷 |
-| `migrate` | 一次性迁移 Job/命令 |
-| `backup` | 定时 `pg_dump`、校验与保留策略 |
+### 5.4 删除与 tombstone
 
-v1 不部署 Redis、Kafka、对象存储、独立搜索引擎或向量数据库。
-
-### 10.2 服务器建议
-
-- 3–5 人试点：4 vCPU、8–16 GB RAM、100–200 GB SSD。
-- 与 Lab Nexus 可使用同一台主机但必须使用独立数据库、容器、secret 和备份；也可以独立 VM。
-- 使用子域名，例如 `scout.<lab-domain>`。
-- `postgres` 不映射公网端口；只允许内部网络访问。
-- 每日备份 PostgreSQL，并每月至少执行一次恢复到临时实例的演练。
-- 部署前显式执行 migration；API 启动时不自动迁移生产库。
-
-### 10.3 CI/CD
-
-- GitHub Actions：Go lint/test/build、Web typecheck/lint/test/build、OpenAPI diff、Connector build/test。
-- 主分支合并后构建不可变镜像 push 到 GHCR。
-- 部署采用 SSH + `docker compose pull && docker compose up -d`，保留上一版本镜像以便回滚。
-- 数据库迁移和代码发布分开记录；破坏性迁移必须提供回滚或双写/兼容策略。
-- Connector 由 GitHub Release 分发，签名、公证和 appcast 更新必须通过 CI 门禁。
-- 开发、staging、production 使用独立 secret 和数据库；staging 必须定期从 production 的脱敏备份恢复验证。
-
----
-
-## 11. 测试与评测
-
-| 层 | 工具 | 重点 |
+| 事件 | 立即行为 | 最终清理 |
 |---|---|---|
-| Go 单元测试 | `go test` | 领域规则、权限、去重、删除状态机 |
-| 数据库集成 | testcontainers + 真实 PostgreSQL/pgvector | SQL、迁移、事务、向量过滤、RRF |
-| API 契约 | OpenAPI + httptest | 兼容性、错误码、Idempotency-Key |
-| Worker | 任务 fixture + fault injection | 重试、限流、断点恢复、幂等 |
-| Web | Vitest + Playwright | 登录、scope、SSE、错误降级、引用追溯 |
-| Connector | XCTest + mock Local API | 版本兼容、增量游标、单篇失败、撤销 |
-| 检索评测 | 小规模、合规的固定 fixtures | Recall@k、引用正确性、覆盖缺口 |
-| 安全 | 权限矩阵集成测试 | 越权、租户隔离、审计、删除 |
-| 演练 | 备份恢复、断网、限流、provider outage | 可恢复性和降级承诺 |
+| Web API 返回删除 | 文档移出检索 | 30 天后清除派生数据 |
+| 用户撤权或断开连接 | 连接失效，内容移出检索 | 30 天后清除派生数据 |
+| 项目/查询 scope 调整 | 立即改变后续查询过滤 | 不清除个人文库索引 |
+| 主动清空索引 | 立即不可检索 | 立即清除 |
+| 删除项目/会话 | 立即不可见 | 30 天后清除 |
+| 删除账户 | 撤销会话 | 30 天内清除全部派生数据 |
 
-不再恢复旧 57K 中央语料库。评测使用用户授权或明确许可的小型 fixtures，避免重新引入版权和存储问题。
+清理范围包括派生全文、chunk、向量、scope 关系和缓存；不触碰用户 Zotero。
 
 ---
 
-## 12. 建议仓库结构
+## 6. 检索与回答
+
+### 6.1 检索模式
+
+| 模式 | 个人文库 | S2/OpenAlex | 联网搜索 | 输出 |
+|---|:---:|:---:|:---:|---|
+| `my_library` | ✓ |  |  | 个人文库问答与综合 |
+| `gap_fill` | ✓ | ✓ |  | 库内外对照与缺口 |
+| `landscape` | ✓ | ✓ | ✓ | 全景简报 |
+
+### 6.2 证据规则
+
+```text
+EvidenceType = personal_fulltext | structured_abstract | web_context
+```
+
+| 证据类型 | 来源 | 可作为科学结论依据 |
+|---|---|---:|
+| `personal_fulltext` | Zotero Web API 可用 fulltext | 是，最高优先级 |
+| `structured_abstract` | Zotero 元数据、S2 或 OpenAlex | 是，但必须标注摘要级 |
+| `web_context` | 模型供应商原生联网搜索 | 否，只能提供背景和线索 |
+
+- 联网上下文不能单独支撑无保留的科学事实。
+- 证据不足时必须明确说明，并输出未决问题或缺口。
+- 外部发现不得改变个人全文的证据层。
+- 引用必须保留标题、年份、来源、DOI/URL 和可用的文档内定位。
+
+### 6.3 混合检索
+
+1. 应用 workspace、用户、项目、scope、tombstone 和版本过滤。
+2. PostgreSQL FTS 检索标题、元数据和 chunk 文本。
+3. pgvector HNSW 做语义近邻检索。
+4. 使用 RRF 融合关键词和向量排名。
+5. 调用 reranker adapter 重排候选。
+6. 组装证据包并执行引用完整性、冲突和覆盖检查。
+
+`landscape` 的联网上下文来自 `WebSearchProvider`，默认复用 Qwen/DashScope 的原生搜索能力。网页结果必须带 URL 和获取时间，只能作为 `web_context`；发现 DOI/论文链接后再次查询 S2/OpenAlex。
+
+v1 不发放独立 Elasticsearch、Qdrant 或 Milvus。只有实测出现明确瓶颈时才通过 ADR 引入。
+
+---
+
+## 7. 身份、凭据与安全
+
+### 7.1 身份边界
+
+- v1 独立运行，不接 Lab Nexus，不要求 OIDC。
+- 开发期可以使用本地身份适配器、测试用户或内部服务身份。
+- 业务层只依赖 `actor_id`、`workspace_id` 和显式角色。
+- 未来接入外部 IdP 时，只替换适配器，不改变租户和审计边界。
+
+### 7.2 Zotero 凭据
+
+开发期：
+
+- 用户提交只读 Zotero Web API Key。
+- API Key 只在服务端加密保存，浏览器不得持久化。
+- 所有 Zotero 请求由 Go 服务端代理。
+
+正式试点前：
+
+- 切换为 Zotero OAuth 1.0a，获得只读授权。
+- 支持撤销连接和清理凭据。
+- Zotero OAuth 2.0 尚不是当前可用前提，不能把它写成 v1 必需能力。
+
+未来 Connector 若实施，应使用独立设备授权和最小权限凭据，不进入本次架构冻结范围。
+
+### 7.3 安全控制
+
+- 所有公网通信使用 HTTPS。
+- API 和 Worker 均执行服务端授权，不能只依赖前端隐藏按钮。
+- 凭据、密钥和 token 不写入仓库、日志或前端 bundle。
+- 日志不得记录完整私人全文和用户原始问题，除非用户明确启用调试并知情同意。
+- 管理员访问派生内容必须重新认证并生成审计事件。
+- 删除操作必须在活跃索引、向量、缓存和会话关联中一致执行。
+- 搜索和模型请求必须可关闭、可降级、可观测。
+
+---
+
+## 8. 接口与契约
+
+采用 OpenAPI 3.1 描述 REST 接口，SSE 单独定义事件契约。v1 不规定具体数据库字段和完整请求体，只冻结接口域：
+
+| 接口域 | 责任 |
+|---|---|
+| Identity/Workspace | 当前 actor、workspace、角色和开发身份适配 |
+| Zotero Connections | 连接、验证、撤权、同步状态和覆盖信息 |
+| Collections/Scopes | collection 树、项目 scope 和查询 scope |
+| Projects/Sessions | 项目、查询会话、追问和过程状态 |
+| Briefs/Evidence | 简报、证据、引用和缺口 |
+| Discovery | S2/OpenAlex 结果、归一化和去重 |
+| Lifecycle/Audit | 删除、清理、管理员访问记录 |
+| Health/Operations | 健康检查、任务状态和指标入口 |
+
+SSE 只承载受理、阶段、工具状态、降级和完成事件，不传递隐藏推理链。
+
+---
+
+## 9. 部署与运行
+
+### 9.1 本地验证
+
+- PostgreSQL/pgvector 使用容器。
+- Go API、Go Worker 和 React Web 原生运行。
+- 使用开发身份适配器和测试 workspace。
+- 外部供应商凭据通过本地环境变量或 secret 文件注入。
+- 不启动 Connector、不依赖本机 Zotero Local API。
+
+### 9.2 后续单机部署
+
+架构方向是单台 Linux VM + Docker Compose + Caddy：
+
+- Caddy 终止 TLS 并提供同源 Web 静态资源。
+- API 和 Worker 使用同一镜像的不同命令。
+- PostgreSQL/pgvector 作为同机服务，配置卷和每日备份。
+- 远程日志、指标和告警按试点需求逐步接入。
+- 不在本轮实施部署、不冻结域名和服务器供应商。
+
+### 9.3 备份与恢复
+
+- 备份必须覆盖 PostgreSQL 业务数据、派生索引和任务状态。
+- PDF 不在服务端，因此不存在 PDF 备份责任。
+- 恢复演练至少验证连接、scope、派生文本、向量和删除状态的一致性。
+- 备份保留期和 RPO/RTO 在部署设计阶段锁定。
+
+---
+
+## 10. 测试与质量
+
+| 层级 | 工具/方法 | 重点 |
+|---|---|---|
+| Go 单元测试 | `go test` | scope、状态机、同步幂等、删除规则、证据分层 |
+| 数据库集成测试 | testcontainers + PostgreSQL/pgvector | FTS、向量、事务、迁移、并发任务 |
+| Zotero Web API 合同测试 | fixture + 沙箱/脱敏响应 | 分页、since、deleted、429、fulltext 缺失 |
+| Provider 合同测试 | 适配器 fixture | S2/OpenAlex/搜索/LLM 超时和降级 |
+| Web E2E | Playwright | 连接、同步状态、提问、过程、简报、清理 |
+| 检索质量 | 小型合规 golden set | 引用可追溯、证据充分性、缺口判定 |
+| 安全测试 | 授权矩阵 + 脱敏日志检查 | workspace 隔离、凭据、审计、删除 |
+
+禁止测试用例把真实 PDF 或用户私人全文提交到仓库。
+
+---
+
+## 11. 建议仓库结构
 
 ```text
 research-scout/
-├── README.md
+├── cmd/
+│   ├── api/
+│   └── worker/
+├── internal/
+│   ├── identity/
+│   ├── workspace/
+│   ├── zotero/
+│   │   ├── source.go          # ZoteroSource
+│   │   └── webapi/            # v1 WebAPISource
+│   ├── sync/
+│   ├── indexing/
+│   ├── retrieval/
+│   ├── evidence/
+│   ├── agent/
+│   ├── discovery/
+│   ├── brief/
+│   ├── lifecycle/
+│   └── audit/
+├── migrations/
+├── web/
+├── openapi/
 ├── docs/
 │   ├── prd/
 │   └── architecture/
-├── backend/                 # Go module
-│   ├── cmd/server/
-│   ├── cmd/worker/
-│   ├── cmd/migrate/
-│   ├── internal/
-│   └── migrations/
-├── web/                     # React + Vite
-│   ├── src/
-│   └── tests/
-├── connector/
-│   └── macos/               # SwiftUI / Xcode project
-├── contracts/
-│   ├── openapi.yaml
-│   └── events/
-├── deploy/
-│   ├── compose/
-│   └── caddy/
-└── .github/workflows/
+└── deploy/
+    └── compose/
 ```
 
-仓库边界原则：
-
-- Contract、后端领域模型和 Web/Connector 生成模型保持单向依赖。
-- Connector 不复制服务端业务规则，只负责本地读取、幂等上传和状态反馈。
-- 部署配置和迁移脚本与代码同仓，便于一次变更完整审查。
-- 未来若 Connector 需要独立发布节奏，可拆仓；v1 不以拆仓增加协调成本。
+未来 Connector 若实施，应作为独立交付物接入 `internal/zotero` 的同一领域边界，不能把 Local API 逻辑写进 API/Worker。
 
 ---
 
-## 13. 技术决策记录
+## 12. 架构决策记录
 
-| ADR | 决策 | 理由 | 状态 |
-|---|---|---|---|
-| ADR-001 | 单仓库、多交付物 | 契约和端到端变更需要同一提交审查 | 建议 |
-| ADR-002 | Go 模块化单体 + API/Worker 双进程 | 保留并发和任务处理优势，避免微服务复杂度 | 建议 |
-| ADR-003 | Gin + pgx + sqlc + Goose | 复用 Go/Gin 经验，关键 SQL 显式、可审计 | 建议 |
-| ADR-004 | PostgreSQL + pgvector 唯一数据核心 | 事务、权限、删除和向量一致性优先 | 建议 |
-| ADR-005 | PostgreSQL-backed 任务队列 | 减少 Redis/Kafka，任务与业务数据同事务 | 建议 |
-| ADR-006 | React 19 + Vite + Tailwind + shadcn/ui | 与 Lab Nexus 前端一致，适合复杂工作台 | 建议 |
-| ADR-007 | OpenAPI 3.1 + REST + SSE | 跨 Web/Connector 的语言无关契约，易于调试 | 建议 |
-| ADR-008 | Lab Nexus OIDC，不自共享 JWT/DB | 清晰撤权、最小权限和跨应用边界 | **待 Lab Nexus 实现确认** |
-| ADR-009 | SwiftUI Connector，只读 Local API | macOS 原生体验、签名、公证和 Keychain 最合适 | 建议 |
-| ADR-010 | 不保存 PDF、不做服务端 PDF 解析 | 合规、存储成本和 Local API 全文能力共同决定 | 已由 PRD 锁定 |
-| ADR-011 | 有界状态机 RAG，不采用自由 Agent | 可测试、可控成本、可审计证据 | 建议 |
-| ADR-012 | 单 VM + Docker Compose + Caddy | v1 规模不需要 Kubernetes | 建议 |
-| ADR-013 | 旧中央语料库不迁移 | 产品语言改为个人 Zotero 全文，旧库历史已删除 | 已锁定 |
-| ADR-014 | v1 连接器只支持 macOS | 先验证真实工作流，再扩展 Windows/Linux | 已由 PRD 锁定 |
+| ADR | 决策 | 状态 |
+|---|---|---|
+| ADR-001 | Go 模块化单体，API + Worker 同仓 | 已采用 |
+| ADR-002 | PostgreSQL/pgvector 作为唯一数据核心 | 已采用 |
+| ADR-003 | GORM 统一数据访问，复杂 SQL 封装在 repository | 已采用 |
+| ADR-004 | PostgreSQL-backed 任务队列优先 River | 已采用 |
+| ADR-005 | React 19 + Vite + TanStack Query | 已采用 |
+| ADR-006 | OpenAPI 3.1 + REST + SSE | 已采用 |
+| ADR-007 | v1 仅使用 Zotero Web API，个人 My Library | 已采用 |
+| ADR-008 | Connector 仅作为未来可选实现 | 已采用 |
+| ADR-009 | 服务端加密保存 Zotero 凭据并代理调用 | 已采用 |
+| ADR-010 | 开发期 API Key，试点前 OAuth 1.0a | 已采用 |
+| ADR-011 | v1 不接 Lab Nexus、不实现 OIDC | 已采用 |
+| ADR-012 | 不保存 PDF、不解析 PDF、不索引批注/笔记 | 已采用 |
+| ADR-013 | 证据分层和三种检索模式固定 | 已采用 |
+| ADR-014 | 本地验证优先，后续单机 Docker Compose | 已采用 |
+| ADR-015 | 优先复用模型供应商原生联网搜索，默认 Qwen/DashScope | 已采用；见 [`ADR-015`](./adr/ADR-015-provider-native-web-search.md) |
+
+任何改变上述边界的方案必须新增 ADR，不能以“顺手扩展”方式绕过。
 
 ---
 
-## 14. 实施顺序
+## 13. 实施顺序
 
-### 阶段 0：未知项验证（技术 spike）
+### 阶段 0：架构与协议验证
 
-1. 验证 Zotero Local API 在目标 macOS/Zotero 版本上的 collection、items、`since` 和 fulltext 行为。
-2. 确认 Lab Nexus OIDC Provider 是否可以在独立变更中加入；确认 issuer、callback、role claim 和撤销行为。
-3. 用一个最小 Swift Connector 读取真实 collection 并上传脱敏样本到本地 API。
-4. 验证 pgvector 维度、HNSW 和 Postgres FTS 在真实中英文全文样本上的延迟。
-5. 选定 LLM、embedding 和联网搜索 provider，并确认数据出境和费用政策。
+1. 用脱敏 fixture 验证 Zotero Web API 的 collections、items、`since`、`format=versions`、deleted 和 fulltext 行为。
+2. 验证 API Key 服务端加密、注销和 429 退避。
+3. 建立 OpenAPI 骨架、PostgreSQL migration 和 Worker 任务模型。
+4. 验证 pgvector 维度、FTS 和 scope 过滤在个人文库样本上的延迟。
 
-### 阶段 1：身份、同步与索引闭环
+### 阶段 1：Zotero 同步与索引闭环
 
-- 建立 monorepo、OpenAPI 骨架、Go API/Worker、Postgres migration。
-- 完成 Lab Nexus OIDC 开发和 Research Scout 会话。
-- 完成 collection 授权、增量同步、设备凭据撤销。
-- 完成 fulltext/chunk/embedding 和覆盖状态页面。
+- 完成开发身份适配器和 workspace 边界。
+- 完成 Web API 连接、My Library 全量同步和增量同步。
+- 完成元数据、available fulltext、chunk、embedding 和覆盖状态。
+- 完成本地-only 缺口提示、tombstone 和清理任务。
 
 ### 阶段 2：个人文库 RAG
 
-- 完成项目、项目 scope、query session 和简报数据模型。
-- 完成 FTS + pgvector + RRF + reranker。
-- 完成有界状态机、SSE 过程展示和引用校验。
-- 完成 `my_library` 模式的验收。
+- 完成项目、collection scope、QuerySession 和 ResearchBrief。
+- 完成 FTS + pgvector + RRF + reranker adapter。
+- 完成有界状态机、SSE 过程展示、证据分层和引用校验。
+- 验证 `my_library` 模式和摘要降级。
 
 ### 阶段 3：外部发现与全景调研
 
-- 接入 Semantic Scholar、OpenAlex 适配器。
+- 接入 Semantic Scholar、OpenAlex。
 - 完成 DOI/标题归一化、库内外去重和三类缺口。
-- 接入一个通用搜索 provider，严格限制为 `landscape` 模式。
-- 完成来源降级、冲突展示和简报生成。
+- 接入 Qwen/DashScope Provider-native Web Search，限制为 `landscape`。
+- 完成来源限流、降级和冲突展示。
 
-### 阶段 4：安全、生命周期和试点
+### 阶段 4：生命周期、试点与部署
 
-- 完成审计、删除队列、30 天清理、备份恢复。
-- 完成 Connector 签名、公证、自动更新和卸载。
-- 部署 staging、执行 Playwright 和真实用户验收。
-- 以 3–5 人试点数据和反馈决定是否扩展。
+- 完成审计、删除队列、30 天清理和恢复演练。
+- 完成 staging、备份、监控和告警。
+- 进行 3–5 人试点，决定是否需要 Connector 等后续能力。
 
 ---
 
-## 15. 待确认项
+## 14. 待确认项
 
-以下问题不改变上述大方向，但会影响具体实现：
+以下问题不改变架构边界，只影响后续技术设计：
 
 | 问题 | 影响 | 当前默认 |
 |---|---|---|
-| Lab Nexus OIDC 由谁实现、何时完成 | 阻塞正式登录和设备授权 | 作为阶段 0 前置；开发环境使用 mock auth |
-| Lab Nexus 是否要引入 organization/tenant | 决定 workspace 解析和迁入成本 | v1 一次部署一个 workspace，数据模型保留 workspace_id |
-| 目标 macOS/Zotero 最低版本 | Connector 兼容矩阵和测试矩阵 | 建议 macOS 14+、Zotero 当前稳定版，spike 后锁定 |
-| Local API 全文覆盖率 | 影响用户看到 `fulltext_unavailable` 的比例 | 不绕过 Local API，不自动上传 PDF |
-| LLM/embedding provider 与数据出境策略 | 影响成本、延迟、隐私声明和部署地域 | 适配器化，国内优先评估 DashScope/Qwen |
-| 联网搜索 provider | 影响 `landscape` 结果质量和可用性 | 先做适配器，待访问性和合同评估后选择 |
-| 域名、服务器和 TLS 方式 | 影响 OIDC callback、Cookie 域和部署 | 独立子域名 + Caddy 自动 TLS |
-| 备份保留期和恢复目标 | 影响磁盘和运维成本 | 每日备份，至少保留 30 天，定期恢复演练 |
+| Zotero OAuth 1.0a 的具体接入库和回调域名 | 试点前后台登录和撤权 | 开发期 API Key；试点前 OAuth |
+| Web API fulltext 的实际覆盖率 | 影响 `personal_fulltext` 比例 | 不绕过 Web API，缺口显式可见 |
+| 首个 LLM/Embedding provider 和数据出境策略 | 成本、延迟、隐私声明 | Provider adapter；优先评估 DashScope/Qwen |
+| 联网搜索 provider | `landscape` 质量和可用性 | 默认 Qwen/DashScope 原生搜索；不可用时显式降级 |
+| 远程部署域名、主机和 TLS | 后期部署与备份 | 本轮不实施 |
+| 备份保留期和 RPO/RTO | 运维和合规 | 部署设计阶段确定 |
+| 个人文库最大规模 | worker 并发和索引成本 | 先按试点数据，后续根据指标调整 |
 
 ---
 
-## 16. 结论
+## 15. 结论
 
-这套方案的核心不是“堆更多 AI 组件”，而是把 Research Scout 收敛为一个可运维、可审计、可替换供应商的研究基础设施：
+v1 的核心是先把“用户已有文库、外部发现、证据化简报”做成可运行的闭环，而不是先解决所有来源和本地安装问题：
 
-- 用户自己的 Zotero 提供全文事实源；
-- Connector 只负责本地读取和增量传输；
-- Go 模块化单体负责同步、检索、任务和生成；
-- PostgreSQL/pgvector 负责唯一的可验证数据状态；
-- React/Vite 负责研究工作台；
-- Lab Nexus 通过 OIDC 提供身份和角色，不共享凭据；
-- 外部学术来源和模型只是可替换的适配器；
-- 3–5 人试点用单 VM Docker Compose，不提前引入分布式系统成本。
+- Zotero Web API 提供 v1 可集中部署的事实源。
+- `ZoteroSource` 隔离未来 Connector，不让本地 API 绑死当前架构。
+- Go 模块化单体负责同步、索引、检索和 Agent。
+- PostgreSQL/pgvector 作为唯一可验证数据状态。
+- React/Vite Web 提供工作台和过程可见性。
+- S2、OpenAlex、原生联网搜索和模型都是可替换适配器。
+- 本地-only 缺口被明确展示，而不是被伪装成覆盖完整。
+- v1 先独立于 Lab Nexus 和 Connector 建立产品闭环，架构保留未来替换和扩展边界。

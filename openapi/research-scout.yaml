@@ -1,0 +1,1184 @@
+openapi: 3.1.0
+info:
+  title: Research Scout API
+  version: 1.1.0
+  description: |
+    Research Scout v1 REST and SSE contract. The contract freezes resource shape,
+    status semantics, idempotency, and event fields for implementation planning.
+servers:
+  - url: https://{host}/api/v1
+    variables:
+      host:
+        default: localhost:8080
+security:
+  - bearerAuth: []
+  - localActorHeader: []
+tags:
+  - name: Identity
+    description: Current actor, workspace, and role.
+  - name: Zotero
+    description: Zotero Web API connections, collections, sync, and coverage.
+  - name: Projects
+    description: Research projects and collection scope snapshots.
+  - name: Sessions
+    description: Query sessions, turns, events, and cancellation.
+  - name: Briefs
+    description: Versioned briefs, evidence, gaps, feedback, and exports.
+  - name: Discovery
+    description: Semantic Scholar and OpenAlex discovery.
+  - name: Lifecycle
+    description: Tombstones, audit, index cleanup, and account deletion.
+  - name: Operations
+    description: Health, readiness, and metrics endpoints.
+paths:
+  /me:
+    get:
+      tags: [Identity]
+      operationId: getMe
+      summary: "Get current actor and workspace"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Current actor and workspace.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Me'}
+        default: {$ref: '#/components/responses/Problem'}
+  /healthz:
+    get:
+      tags: [Operations]
+      security: []
+      operationId: healthz
+      summary: "Check process liveness"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Health'}
+  /readyz:
+    get:
+      tags: [Operations]
+      security: []
+      operationId: readyz
+      summary: "Check dependency readiness"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Required dependencies are ready.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Ready'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /metrics:
+    get:
+      tags: [Operations]
+      security: []
+      operationId: metrics
+      summary: "Export Prometheus metrics"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Prometheus exposition text.
+          content:
+            text/plain:
+              schema: {type: string}
+  /zotero/connections:
+    get:
+      tags: [Zotero]
+      operationId: listZoteroConnections
+      summary: "List Zotero connections"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Connections visible to the current workspace.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Connection'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Zotero]
+      operationId: createZoteroConnection
+      summary: "Create a Zotero connection"
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ConnectionCreate'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '201':
+          description: Connection created and validated asynchronously.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Connection'}
+        default: {$ref: '#/components/responses/Problem'}
+  /zotero/connections/{connectionId}:
+    get:
+      tags: [Zotero]
+      operationId: getZoteroConnection
+      summary: "Get a Zotero connection"
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Redacted connection state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Connection'}
+        default: {$ref: '#/components/responses/Problem'}
+  /zotero/connections/{connectionId}/validate:
+    post:
+      tags: [Zotero]
+      operationId: validateZoteroConnection
+      summary: "Validate a Zotero connection"
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Connection validation result.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Connection'}
+        default: {$ref: '#/components/responses/Problem'}
+  /zotero/connections/{connectionId}/sync:
+    post:
+      tags: [Zotero]
+      operationId: startZoteroSync
+      summary: "Start a Zotero sync run"
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SyncRequest'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Sync accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SyncRun'}
+        '409': {$ref: '#/components/responses/Problem'}
+        default: {$ref: '#/components/responses/Problem'}
+  /zotero/connections/{connectionId}/revoke:
+    post:
+      tags: [Zotero]
+      operationId: revokeZoteroConnection
+      summary: "Revoke a Zotero connection"
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Revocation accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LifecycleTombstone'}
+        default: {$ref: '#/components/responses/Problem'}
+  /zotero/connections/{connectionId}/coverage:
+    get:
+      tags: [Zotero]
+      operationId: getZoteroCoverage
+      summary: "Get Zotero coverage status"
+      parameters:
+        - $ref: '#/components/parameters/ConnectionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Coverage summary for the latest successful sync.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Coverage'}
+        default: {$ref: '#/components/responses/Problem'}
+  /zotero/collections:
+    get:
+      tags: [Zotero]
+      operationId: listZoteroCollections
+      summary: "List Zotero collections"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Collection tree for the current connection.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Collection'}
+        default: {$ref: '#/components/responses/Problem'}
+  /projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: "List research projects"
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Project page.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProjectPage'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: "Create a research project"
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProjectCreate'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '201':
+          description: Project created.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        default: {$ref: '#/components/responses/Problem'}
+  /projects/{projectId}:
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: "Get a research project"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Project.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Projects]
+      operationId: updateProject
+      summary: "Update a research project"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProjectPatch'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Updated project.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Project'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Projects]
+      operationId: deleteProject
+      summary: "Delete a research project"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Project deletion accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LifecycleTombstone'}
+        default: {$ref: '#/components/responses/Problem'}
+  /projects/{projectId}/scope:
+    get:
+      tags: [Projects]
+      operationId: getProjectScope
+      summary: "Get the current project scope"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Current project scope.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Scope'}
+        default: {$ref: '#/components/responses/Problem'}
+    put:
+      tags: [Projects]
+      operationId: putProjectScope
+      summary: "Replace the current project scope"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ScopeInput'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Saved scope snapshot.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Scope'}
+        default: {$ref: '#/components/responses/Problem'}
+  /projects/{projectId}/sessions:
+    get:
+      tags: [Sessions]
+      operationId: listQuerySessions
+      summary: "List query sessions for a project"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Session page.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionPage'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Sessions]
+      operationId: createQuerySession
+      summary: "Create a query session"
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SessionCreate'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Query accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        default: {$ref: '#/components/responses/Problem'}
+  /sessions/{sessionId}:
+    get:
+      tags: [Sessions]
+      operationId: getQuerySession
+      summary: "Get a query session"
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Current session and phase.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Sessions]
+      operationId: deleteQuerySession
+      summary: "Delete a query session"
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Session deletion accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LifecycleTombstone'}
+        default: {$ref: '#/components/responses/Problem'}
+  /sessions/{sessionId}/turns:
+    get:
+      tags: [Sessions]
+      operationId: listQueryTurns
+      summary: "List query turns"
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Turns in the session.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Turn'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Sessions]
+      operationId: createQueryTurn
+      summary: "Create a follow-up turn"
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TurnCreate'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Follow-up accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Turn'}
+        default: {$ref: '#/components/responses/Problem'}
+  /sessions/{sessionId}/events:
+    get:
+      tags: [Sessions]
+      operationId: streamQueryEvents
+      summary: "Stream session events over SSE"
+      x-sse-event-schema: {$ref: '#/components/schemas/SSEEvent'}
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: {type: integer, minimum: 0}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Server-sent events. Each frame serializes one SSEEvent envelope.
+          content:
+            text/event-stream:
+              schema: {$ref: '#/components/schemas/SSEEvent'}
+        '410': {$ref: '#/components/responses/Problem'}
+        default: {$ref: '#/components/responses/Problem'}
+  /sessions/{sessionId}/brief:
+    get:
+      tags: [Briefs]
+      operationId: getCurrentBrief
+      summary: "Get the current session brief"
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Current complete brief.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Brief'}
+        default: {$ref: '#/components/responses/Problem'}
+  /sessions/{sessionId}/cancel:
+    post:
+      tags: [Sessions]
+      operationId: cancelQuerySession
+      summary: "Cancel a running query session"
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Cancellation accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        default: {$ref: '#/components/responses/Problem'}
+  /briefs/{briefId}:
+    get:
+      tags: [Briefs]
+      operationId: getBrief
+      summary: "Get a published research brief"
+      parameters:
+        - $ref: '#/components/parameters/BriefId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Structured brief.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Brief'}
+        default: {$ref: '#/components/responses/Problem'}
+  /briefs/{briefId}/evidence:
+    get:
+      tags: [Briefs]
+      operationId: listBriefEvidence
+      summary: "List brief evidence"
+      parameters:
+        - $ref: '#/components/parameters/BriefId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Evidence rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Evidence'}
+        default: {$ref: '#/components/responses/Problem'}
+  /briefs/{briefId}/gaps:
+    get:
+      tags: [Briefs]
+      operationId: listBriefGaps
+      summary: "List brief gaps"
+      parameters:
+        - $ref: '#/components/parameters/BriefId'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Gap rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Gap'}
+        default: {$ref: '#/components/responses/Problem'}
+  /briefs/{briefId}/feedback:
+    post:
+      tags: [Briefs]
+      operationId: submitBriefFeedback
+      summary: "Submit brief feedback"
+      parameters:
+        - $ref: '#/components/parameters/BriefId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Feedback'}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '204': {description: Feedback stored}
+        default: {$ref: '#/components/responses/Problem'}
+  /briefs/{briefId}/export:
+    get:
+      tags: [Briefs]
+      operationId: exportBrief
+      summary: "Export a brief or citation list"
+      parameters:
+        - $ref: '#/components/parameters/BriefId'
+        - name: format
+          in: query
+          schema: {type: string, enum: [json, bibtex, csv], default: json}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Exported brief or citation list.
+          content:
+            application/json:
+              schema: {}
+            text/plain:
+              schema: {type: string}
+        default: {$ref: '#/components/responses/Problem'}
+  /evidence/{evidenceId}:
+    get:
+      tags: [Briefs]
+      operationId: getEvidence
+      summary: "Get evidence and traceability metadata"
+      parameters:
+        - name: evidenceId
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Evidence and its traceability metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Evidence'}
+        default: {$ref: '#/components/responses/Problem'}
+  /discovery/search:
+    get:
+      tags: [Discovery]
+      operationId: searchDiscoveryWorks
+      summary: "Search structured scholarly sources"
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 500}
+        - name: sources
+          in: query
+          schema:
+            type: array
+            items: {type: string, enum: [semantic_scholar, openalex]}
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Normalized external work results.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DiscoveryPage'}
+        default: {$ref: '#/components/responses/Problem'}
+  /discovery/works/{externalWorkId}:
+    get:
+      tags: [Discovery]
+      operationId: getDiscoveryWork
+      summary: "Get normalized external work metadata"
+      parameters:
+        - name: externalWorkId
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: External work metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ExternalWork'}
+        default: {$ref: '#/components/responses/Problem'}
+  /discovery/works/{externalWorkId}/citations:
+    get:
+      tags: [Discovery]
+      operationId: getDiscoveryCitations
+      summary: "Get external citation relations"
+      parameters:
+        - name: externalWorkId
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Citation or reference relations when available.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/ExternalWork'}
+        default: {$ref: '#/components/responses/Problem'}
+  /lifecycle/clear-index:
+    post:
+      tags: [Lifecycle]
+      operationId: clearIndex
+      summary: "Clear the indexed library"
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Index clear accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LifecycleTombstone'}
+        default: {$ref: '#/components/responses/Problem'}
+  /lifecycle/tombstones:
+    get:
+      tags: [Lifecycle]
+      operationId: listLifecycleTombstones
+      summary: "List lifecycle tombstones"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Active and recent tombstones.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/LifecycleTombstone'}
+        default: {$ref: '#/components/responses/Problem'}
+  /audit-events:
+    get:
+      tags: [Lifecycle]
+      operationId: listAuditEvents
+      summary: "List user-visible audit events"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: User-visible audit events.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/AuditEvent'}
+        default: {$ref: '#/components/responses/Problem'}
+  /admin/audit-access:
+    post:
+      tags: [Lifecycle]
+      operationId: adminAuditAccess
+      summary: "Access derived content with audit"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_type, target_id, reason, reauth_token]
+              properties:
+                target_type: {type: string}
+                target_id: {type: string}
+                reason: {type: string, minLength: 1}
+                reauth_token: {type: string}
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '200':
+          description: Audited derived content access.
+          content:
+            application/json:
+              schema: {}
+        default: {$ref: '#/components/responses/Problem'}
+  /account:
+    delete:
+      tags: [Lifecycle]
+      operationId: deleteAccount
+      summary: "Delete the current account"
+      responses:
+        '4XX': {$ref: '#/components/responses/Problem'}
+        '202':
+          description: Account deletion accepted.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LifecycleTombstone'}
+        default: {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    localActorHeader:
+      type: apiKey
+      in: header
+      name: X-Dev-Actor
+  parameters:
+    ConnectionId:
+      name: connectionId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    BriefId:
+      name: briefId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    Cursor:
+      name: cursor
+      in: query
+      schema: {type: string}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: {type: string, minLength: 8, maxLength: 200}
+  responses:
+    Problem:
+      description: Standard problem response.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Problem'}
+  schemas:
+    Problem:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable, request_id]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            retryable: {type: boolean}
+            request_id: {type: string}
+            details: {type: object, additionalProperties: true}
+    Actor:
+      type: object
+      required: [id, display_name]
+      properties:
+        id: {type: string, format: uuid}
+        display_name: {type: string}
+    Workspace:
+      type: object
+      required: [id, name]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+    Me:
+      type: object
+      required: [actor, workspace, role, identity_provider]
+      properties:
+        actor: {$ref: '#/components/schemas/Actor'}
+        workspace: {$ref: '#/components/schemas/Workspace'}
+        role: {type: string, enum: [user, admin]}
+        identity_provider: {type: string}
+    ConnectionCreate:
+      type: object
+      required: [library_type, library_id, api_key]
+      properties:
+        library_type: {type: string, enum: [user]}
+        library_id: {type: string}
+        api_key: {type: string, writeOnly: true}
+        display_name: {type: string, maxLength: 200}
+    Connection:
+      type: object
+      required: [id, provider, library_type, library_id, status, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        provider: {type: string, enum: [web_api]}
+        library_type: {type: string, enum: [user]}
+        library_id: {type: string}
+        display_name: {type: string}
+        status: {type: string, enum: [healthy, degraded, disconnected, revoked]}
+        last_library_version: {type: [integer, 'null'], format: int64}
+        last_sync_at: {type: [string, 'null'], format: date-time}
+        last_success_at: {type: [string, 'null'], format: date-time}
+        created_at: {type: string, format: date-time}
+    SyncRequest:
+      type: object
+      properties:
+        mode: {type: string, enum: [full, incremental, retry], default: incremental}
+        force_full: {type: boolean, default: false}
+    SyncRun:
+      type: object
+      required: [id, connection_id, mode, status, started_at]
+      properties:
+        id: {type: string, format: uuid}
+        connection_id: {type: string, format: uuid}
+        mode: {type: string, enum: [full, incremental, retry]}
+        status: {type: string, enum: [pending, running, partial, complete, failed, canceled]}
+        from_version: {type: [integer, 'null'], format: int64}
+        to_version: {type: [integer, 'null'], format: int64}
+        counters: {type: object, additionalProperties: true}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: [string, 'null'], format: date-time}
+    Coverage:
+      type: object
+      required: [visible_items, indexed_documents, personal_fulltext, structured_abstract, metadata_only, failed, local_only_warning]
+      properties:
+        visible_items: {type: integer, minimum: 0}
+        indexed_documents: {type: integer, minimum: 0}
+        personal_fulltext: {type: integer, minimum: 0}
+        structured_abstract: {type: integer, minimum: 0}
+        metadata_only: {type: integer, minimum: 0}
+        failed: {type: integer, minimum: 0}
+        last_success_at: {type: [string, 'null'], format: date-time}
+        local_only_warning: {type: boolean}
+    Collection:
+      type: object
+      required: [id, zotero_key, name, is_deleted]
+      properties:
+        id: {type: string, format: uuid}
+        zotero_key: {type: string}
+        parent_key: {type: [string, 'null']}
+        name: {type: string}
+        version: {type: integer, format: int64}
+        is_deleted: {type: boolean}
+    ProjectCreate:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 200}
+        description: {type: string, maxLength: 2000}
+        default_mode: {type: string, enum: [my_library, gap_fill, landscape], default: my_library}
+        scope: {$ref: '#/components/schemas/ScopeInput'}
+    ProjectPatch:
+      type: object
+      properties:
+        name: {type: string, minLength: 1, maxLength: 200}
+        description: {type: string, maxLength: 2000}
+        default_mode: {type: string, enum: [my_library, gap_fill, landscape]}
+    Project:
+      type: object
+      required: [id, name, default_mode, scope_mode, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        description: {type: string}
+        default_mode: {type: string, enum: [my_library, gap_fill, landscape]}
+        scope_mode: {type: string, enum: [all_library, selected_collections]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    ScopeInput:
+      type: object
+      required: [scope_mode]
+      properties:
+        scope_mode: {type: string, enum: [all_library, selected_collections]}
+        collection_ids:
+          type: array
+          items: {type: string, format: uuid}
+    Scope:
+      type: object
+      required: [scope_mode, version]
+      properties:
+        scope_mode: {type: string, enum: [all_library, selected_collections]}
+        collection_ids:
+          type: array
+          items: {type: string, format: uuid}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+    SessionCreate:
+      type: object
+      required: [question, mode]
+      properties:
+        question: {type: string, minLength: 3, maxLength: 10000}
+        mode: {type: string, enum: [my_library, gap_fill, landscape]}
+        scope: {$ref: '#/components/schemas/ScopeInput'}
+    TurnCreate:
+      type: object
+      required: [question]
+      properties:
+        question: {type: string, minLength: 3, maxLength: 10000}
+        mode: {type: string, enum: [my_library, gap_fill, landscape]}
+        scope: {$ref: '#/components/schemas/ScopeInput'}
+    Session:
+      type: object
+      required: [id, project_id, mode, status, phase, events_url, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        current_turn_id: {type: [string, 'null'], format: uuid}
+        mode: {type: string, enum: [my_library, gap_fill, landscape]}
+        status: {type: string, enum: [accepted, running, degraded, completed, failed, canceled]}
+        phase: {type: string, enum: [accepted, planning, retrieving_library, retrieving_scholarly, retrieving_web, ranking, drafting, verifying, completed]}
+        plan: {type: object, additionalProperties: true}
+        source_status: {type: array, items: {$ref: '#/components/schemas/SourceStatus'}}
+        events_url: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+    Turn:
+      type: object
+      required: [id, session_id, turn_no, question, mode, status, phase, index_epoch_id, planner_version, retrieval_config_version, prompt_version, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        session_id: {type: string, format: uuid}
+        turn_no: {type: integer, minimum: 1}
+        question: {type: string}
+        mode: {type: string, enum: [my_library, gap_fill, landscape]}
+        status: {type: string, enum: [accepted, running, degraded, completed, failed, canceled]}
+        phase: {type: string}
+        scope_snapshot: {$ref: '#/components/schemas/Scope'}
+        index_epoch_id: {type: [string, 'null'], format: uuid}
+        planner_version: {type: string}
+        retrieval_config_version: {type: string}
+        prompt_version: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+    SSEEvent:
+      type: object
+      required: [id, seq, type, at, data]
+      properties:
+        id: {type: string}
+        seq: {type: integer, minimum: 0}
+        type:
+          type: string
+          enum: [session_accepted, plan_updated, phase_changed, tool_started, tool_completed, source_status, evidence_ready, brief_ready, error, heartbeat]
+        at: {type: string, format: date-time}
+        data: {type: object, additionalProperties: true}
+    SourceStatus:
+      type: object
+      required: [source, status]
+      properties:
+        source: {type: string, enum: [zotero, semantic_scholar, openalex, qwen_web_search]}
+        status: {type: string, enum: [available, degraded, unavailable, skipped]}
+        degraded_reason: {type: [string, 'null']}
+        request_id: {type: [string, 'null']}
+    Evidence:
+      type: object
+      required: [id, brief_id, index_epoch_id, evidence_type, title, score, retrieved_at]
+      properties:
+        id: {type: string, format: uuid}
+        brief_id: {type: string, format: uuid}
+        index_epoch_id: {type: [string, 'null'], format: uuid, description: "Query epoch for library evidence; null for external web-only evidence."}
+        evidence_type: {type: string, enum: [personal_fulltext, structured_abstract, web_context]}
+        title: {type: string}
+        quote: {type: [string, 'null']}
+        url: {type: [string, 'null'], format: uri}
+        document_id: {type: [string, 'null'], format: uuid}
+        document_version_id: {type: [string, 'null'], format: uuid}
+        chunk_id: {type: [string, 'null'], format: uuid}
+        external_work_id: {type: [string, 'null'], format: uuid}
+        locator: {type: object, additionalProperties: true}
+        score: {type: number}
+        retrieved_at: {type: string, format: date-time}
+    ClaimEvidence:
+      type: object
+      required: [evidence_id, stance]
+      properties:
+        evidence_id: {type: string, format: uuid}
+        stance: {type: string, enum: [supports, refutes, background]}
+        support_score: {type: number, minimum: 0, maximum: 1}
+        evidence_span: {type: [string, 'null']}
+        locator: {type: object, additionalProperties: true}
+    Claim:
+      type: object
+      required: [claim_id, claim_type, text, support_level, verification_status, claim_evidence]
+      properties:
+        claim_id: {type: string, format: uuid}
+        claim_type: {type: string, enum: [summary, finding, method, chronology]}
+        text: {type: string}
+        support_level: {type: string, enum: [sufficient, partial, insufficient]}
+        confidence: {type: [number, 'null'], minimum: 0, maximum: 1}
+        verification_status: {type: string, enum: [pending, verified, partial, rejected]}
+        claim_evidence:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/ClaimEvidence'}
+    Finding:
+      type: object
+      required: [claim_id, claim_type, claim, support_level, verification_status, evidence_ids, claim_evidence]
+      properties:
+        claim_id: {type: string, format: uuid}
+        claim_type: {type: string, enum: [finding]}
+        claim: {type: string}
+        support_level: {type: string, enum: [sufficient, partial, insufficient]}
+        confidence: {type: [number, 'null'], minimum: 0, maximum: 1}
+        verification_status: {type: string, enum: [pending, verified, partial, rejected]}
+        evidence_ids:
+          type: array
+          items: {type: string, format: uuid}
+        claim_evidence:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/ClaimEvidence'}
+    Gap:
+      type: object
+      required: [id, gap_type, missing_relative_to, explanation]
+      properties:
+        id: {type: string, format: uuid}
+        gap_type: {type: string, enum: [canonical, related_method, latest_progress]}
+        missing_relative_to: {type: string, enum: [personal_library, current_scope, external_only]}
+        external_work_id: {type: [string, 'null'], format: uuid}
+        document_id: {type: [string, 'null'], format: uuid}
+        explanation: {type: string}
+        score: {type: number}
+    Brief:
+      type: object
+      required: [id, session_id, turn_id, schema_version, index_epoch_id, retrieval_config_version, prompt_version, summary, summary_claims, findings, method_timeline, chronology, gaps, open_questions, citations, source_status, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        session_id: {type: string, format: uuid}
+        turn_id: {type: string, format: uuid}
+        schema_version: {type: string}
+        index_epoch_id: {type: string, format: uuid}
+        retrieval_config_version: {type: string}
+        prompt_version: {type: string}
+        summary: {type: string}
+        summary_claims:
+          type: array
+          items: {$ref: '#/components/schemas/Claim'}
+        findings:
+          type: array
+          items: {$ref: '#/components/schemas/Finding'}
+        method_timeline:
+          type: array
+          items: {type: object, additionalProperties: true}
+        chronology:
+          type: array
+          items: {type: object, additionalProperties: true}
+        gaps:
+          type: array
+          items: {$ref: '#/components/schemas/Gap'}
+        open_questions:
+          type: array
+          items: {type: string}
+        citations:
+          type: array
+          items: {$ref: '#/components/schemas/Evidence'}
+        source_status:
+          type: array
+          items: {$ref: '#/components/schemas/SourceStatus'}
+        created_at: {type: string, format: date-time}
+    Feedback:
+      type: object
+      required: [rating]
+      properties:
+        rating: {type: integer, minimum: -1, maximum: 1}
+        comment: {type: string, maxLength: 2000}
+    ExternalWork:
+      type: object
+      required: [id, identity_key, title, source_status]
+      properties:
+        id: {type: string, format: uuid}
+        identity_key: {type: string}
+        doi: {type: [string, 'null']}
+        s2_id: {type: [string, 'null']}
+        openalex_id: {type: [string, 'null']}
+        pmid: {type: [string, 'null']}
+        title: {type: string}
+        abstract: {type: [string, 'null']}
+        year: {type: [integer, 'null']}
+        venue: {type: [string, 'null']}
+        citation_count: {type: [integer, 'null']}
+        type: {type: [string, 'null']}
+        source_status: {$ref: '#/components/schemas/SourceStatus'}
+    PageMeta:
+      type: object
+      properties:
+        next_cursor: {type: [string, 'null']}
+    ProjectPage:
+      type: object
+      required: [items, meta]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Project'}
+        meta: {$ref: '#/components/schemas/PageMeta'}
+    SessionPage:
+      type: object
+      required: [items, meta]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Session'}
+        meta: {$ref: '#/components/schemas/PageMeta'}
+    DiscoveryPage:
+      type: object
+      required: [items, meta, source_status]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/ExternalWork'}
+        meta: {$ref: '#/components/schemas/PageMeta'}
+        source_status:
+          type: array
+          items: {$ref: '#/components/schemas/SourceStatus'}
+    LifecycleTombstone:
+      type: object
+      required: [id, object_type, object_id, reason, status, purge_after]
+      properties:
+        id: {type: string, format: uuid}
+        object_type: {type: string, enum: [zotero_connection, document, project, query_session, account]}
+        object_id: {type: string}
+        reason: {type: string}
+        status: {type: string, enum: [active, purging, purged, retry]}
+        purge_after: {type: string, format: date-time}
+    AuditEvent:
+      type: object
+      required: [id, action, target_type, target_id, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        actor_id: {type: [string, 'null'], format: uuid}
+        action: {type: string}
+        target_type: {type: string}
+        target_id: {type: string}
+        reason: {type: [string, 'null']}
+        request_id: {type: string}
+        created_at: {type: string, format: date-time}
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [ok]}
+    Ready:
+      type: object
+      required: [status, checks]
+      properties:
+        status: {type: string, enum: [ready, degraded]}
+        checks: {type: object, additionalProperties: true}
