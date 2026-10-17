@@ -4,32 +4,68 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"research-scout/internal/discovery"
 	"research-scout/internal/domain"
 	"research-scout/internal/embedding"
+	"research-scout/internal/planner"
+	"research-scout/internal/retrieval"
 	"research-scout/internal/storage"
 )
 
 type EngineConfig struct {
 	PlannerVersion         string
 	RetrievalConfigVersion string
+	RerankVersion          string
 	PromptVersion          string
 }
 
 type Engine struct {
-	Store  *storage.Store
-	Config EngineConfig
-	Stub   embedding.Stub
+	Store     *storage.Store
+	Config    EngineConfig
+	Stub      embedding.Stub
+	Reranker  retrieval.RerankProvider
+	Discovery DiscoveryRunner
 }
 
 type SourceStatus struct {
 	Source         string  `json:"source"`
 	Status         string  `json:"status"`
 	DegradedReason *string `json:"degraded_reason,omitempty"`
+}
+
+// DefaultSourceStatuses returns the sources represented by a Stage 2 turn.
+// External discovery remains skipped until Stage 3.
+func DefaultSourceStatuses() []SourceStatus {
+	return []SourceStatus{
+		{Source: "zotero", Status: "available"},
+		{Source: "semantic_scholar", Status: "skipped"},
+		{Source: "openalex", Status: "skipped"},
+		{Source: "qwen_web_search", Status: "skipped"},
+	}
+}
+
+// sourceStatusesForRerank records the actual rerank path, including the
+// deterministic fallback when no provider is configured or the provider fails.
+func sourceStatusesForRerank(outcome retrieval.RerankOutcome) []SourceStatus {
+	statuses := DefaultSourceStatuses()
+	status := SourceStatus{Source: "rerank", Status: "available"}
+	if !outcome.Used {
+		reason := strings.TrimSpace(outcome.DegradedReason)
+		if reason == "" {
+			reason = "rerank_provider_unavailable"
+		}
+		status.Status = "degraded"
+		status.DegradedReason = &reason
+	}
+	return append(statuses, status)
 }
 
 type SessionView struct {
@@ -41,9 +77,24 @@ type SessionView struct {
 }
 
 type RunResult struct {
-	Session SessionView  `json:"session"`
-	Turn    storage.Turn `json:"turn"`
-	Brief   BriefView    `json:"brief"`
+	Session SessionView    `json:"session"`
+	Turn    storage.Turn   `json:"turn"`
+	Brief   BriefView      `json:"brief"`
+	Trace   RetrievalTrace `json:"-"`
+}
+
+// RetrievalTrace is an internal, non-API trace used by the offline evaluator.
+// It is kept separate from BriefView so traces never leak through HTTP
+// responses or become user-visible reasoning.
+type RetrievalTrace struct {
+	CandidateDocuments  []string `json:"-"`
+	CandidateChunks     []string `json:"-"`
+	PreRerankDocuments  []string `json:"-"`
+	PreRerankChunks     []string `json:"-"`
+	PostRerankDocuments []string `json:"-"`
+	PostRerankChunks    []string `json:"-"`
+	SelectedDocuments   []string `json:"-"`
+	SelectedChunks      []string `json:"-"`
 }
 
 type BriefView struct {
@@ -106,17 +157,21 @@ type EvidenceView struct {
 	DocumentID        *string        `json:"document_id,omitempty"`
 	DocumentVersionID *string        `json:"document_version_id,omitempty"`
 	ChunkID           *string        `json:"chunk_id,omitempty"`
+	ExternalWorkID    *string        `json:"external_work_id,omitempty"`
 	Locator           map[string]any `json:"locator"`
 	Score             float64        `json:"score"`
 	RetrievedAt       time.Time      `json:"retrieved_at"`
 }
 
 type GapView struct {
-	ID                string  `json:"id"`
-	GapType           string  `json:"gap_type"`
-	MissingRelativeTo string  `json:"missing_relative_to"`
-	Explanation       string  `json:"explanation"`
-	Score             float64 `json:"score"`
+	ID                string         `json:"id"`
+	GapType           string         `json:"gap_type"`
+	MissingRelativeTo string         `json:"missing_relative_to"`
+	ExternalWorkID    *string        `json:"external_work_id,omitempty"`
+	DocumentID        *string        `json:"document_id,omitempty"`
+	Explanation       string         `json:"explanation"`
+	Score             float64        `json:"score"`
+	Rationale         map[string]any `json:"rationale,omitempty"`
 }
 
 type evidenceRow struct {
@@ -128,6 +183,10 @@ type retrievedChunk struct {
 	ChunkID           string
 	DocumentID        string
 	DocumentVersionID string
+	ExternalWorkID    string
+	URL               string
+	Provider          string
+	Model             string
 	Title             string
 	Content           string
 	Section           string
@@ -137,6 +196,7 @@ type retrievedChunk struct {
 	CharEnd           int
 	EvidenceType      domain.EvidenceType
 	Score             float64
+	RetrievedAt       time.Time
 }
 
 func (e *Engine) RunFirst(ctx context.Context, workspaceID, projectID, question string, mode domain.RetrievalMode) (RunResult, error) {
@@ -201,6 +261,9 @@ func (e *Engine) runTurn(ctx context.Context, workspaceID string, sess storage.S
 	if e.Config.RetrievalConfigVersion == "" {
 		e.Config.RetrievalConfigVersion = "retrieval-v1"
 	}
+	if e.Config.RerankVersion == "" {
+		e.Config.RerankVersion = retrieval.FallbackRerankVersion
+	}
 	if e.Config.PromptVersion == "" {
 		e.Config.PromptVersion = "brief-v1"
 	}
@@ -215,14 +278,19 @@ func (e *Engine) runTurn(ctx context.Context, workspaceID string, sess storage.S
 	if err != nil {
 		return RunResult{}, err
 	}
+	plan := planner.Plan(question)
+	planJSON, err := storage.JSON(plan)
+	if err != nil {
+		return RunResult{}, err
+	}
 	turn := storage.Turn{}
 	_, err = e.Store.Pool().Exec(ctx, `
 		INSERT INTO query_turns
 			(id,session_id,workspace_id,turn_no,question,mode,scope_snapshot_json,index_epoch_id,
-			 planner_version,retrieval_config_version,prompt_version,status,phase)
-		VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,'running','planning')
+			 planner_version,retrieval_config_version,prompt_version,status,phase,plan_json)
+		VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,'running','planning',$12::jsonb)
 	`, turnID, sess.ID, workspaceID, turnNo, question, string(mode), scopeSnapshot, sess.IndexEpochID,
-		e.Config.PlannerVersion, e.Config.RetrievalConfigVersion, e.Config.PromptVersion)
+		e.Config.PlannerVersion, e.Config.RetrievalConfigVersion, e.Config.PromptVersion, planJSON)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -238,19 +306,56 @@ func (e *Engine) runTurn(ctx context.Context, workspaceID string, sess storage.S
 	if err := e.event(ctx, workspaceID, sess.ID, turnID, "phase_changed", map[string]any{"phase": domain.PhasePlanning}); err != nil {
 		return RunResult{}, err
 	}
+	if err := e.event(ctx, workspaceID, sess.ID, turnID, "plan_updated", map[string]any{
+		"plan_version": plan.Version, "intent": plan.Intent, "route": plan.Route,
+		"subquery_count": len(plan.Subqueries),
+	}); err != nil {
+		return RunResult{}, err
+	}
 	if err := e.event(ctx, workspaceID, sess.ID, turnID, "phase_changed", map[string]any{"phase": domain.PhaseRetrievingLibrary, "source": "zotero"}); err != nil {
 		return RunResult{}, err
 	}
 
-	chunks, err := e.retrieve(ctx, workspaceID, sess.IndexEpochID, project, question)
+	chunks, trace, rerankOutcome, err := e.retrieveHybrid(ctx, workspaceID, sess.IndexEpochID, project, plan)
 	if err != nil {
 		_ = e.failTurn(ctx, workspaceID, turnID, err)
 		return RunResult{}, err
 	}
-	for _, c := range chunks {
-		if err := e.event(ctx, workspaceID, sess.ID, turnID, "evidence_ready", map[string]any{
-			"chunk_id": c.ChunkID, "document_id": c.DocumentID, "evidence_type": c.EvidenceType,
+
+	// Stage 3 external discovery: gap_fill and landscape first run structured
+	// scholarly discovery; landscape may then fall back to provider-native web
+	// search when structured coverage still leaves gaps. my_library never
+	// reaches this block and therefore never calls an external source.
+	discoveryResult := emptyDiscoveryResult()
+	if modeAllowsStructured(mode) {
+		if err := e.event(ctx, workspaceID, sess.ID, turnID, "phase_changed", map[string]any{
+			"phase": domain.PhaseRetrievingScholarly, "sources": []string{"semantic_scholar", "openalex"},
 		}); err != nil {
+			return RunResult{}, err
+		}
+		if modeAllowsWebSearch(mode) {
+			if err := e.event(ctx, workspaceID, sess.ID, turnID, "phase_changed", map[string]any{
+				"phase": domain.PhaseRetrievingWeb, "source": "qwen_web_search",
+			}); err != nil {
+				return RunResult{}, err
+			}
+		}
+		var discoveryChunks []retrievedChunk
+		discoveryResult, discoveryChunks = e.runDiscovery(ctx, workspaceID, mode, project, question, deidentifiedTopic(plan), chunks)
+		chunks = mergeEvidence(chunks, discoveryChunks, maxDocumentsForMode(mode))
+	}
+
+	for _, c := range chunks {
+		data := map[string]any{
+			"chunk_id": c.ChunkID, "document_id": c.DocumentID, "evidence_type": c.EvidenceType,
+		}
+		if c.ExternalWorkID != "" {
+			data["external_work_id"] = c.ExternalWorkID
+		}
+		if c.URL != "" {
+			data["url"] = c.URL
+		}
+		if err := e.event(ctx, workspaceID, sess.ID, turnID, "evidence_ready", data); err != nil {
 			return RunResult{}, err
 		}
 	}
@@ -261,7 +366,7 @@ func (e *Engine) runTurn(ctx context.Context, workspaceID string, sess storage.S
 		return RunResult{}, err
 	}
 
-	brief, err := e.persistBrief(ctx, workspaceID, sess, turn, question, chunks)
+	brief, err := e.persistBrief(ctx, workspaceID, sess, turn, question, chunks, rerankOutcome, discoveryResult)
 	if err != nil {
 		_ = e.failTurn(ctx, workspaceID, turnID, err)
 		return RunResult{}, err
@@ -293,9 +398,9 @@ func (e *Engine) runTurn(ctx context.Context, workspaceID string, sess storage.S
 	sess.Phase = string(domain.PhaseCompleted)
 	view := SessionView{
 		Session: sess, CurrentTurnID: turnID, Mode: string(mode), EventsURL: "/api/v1/sessions/" + sess.ID + "/events",
-		SourceStatus: []SourceStatus{{Source: "zotero", Status: "available"}, {Source: "semantic_scholar", Status: "skipped"}, {Source: "qwen_web_search", Status: "skipped"}},
+		SourceStatus: sourceStatusesForTurn(rerankOutcome, discoveryResult.SourceStatus),
 	}
-	return RunResult{Session: view, Turn: turn, Brief: brief}, nil
+	return RunResult{Session: view, Turn: turn, Brief: brief, Trace: trace}, nil
 }
 
 func nextTurnNo(ctx context.Context, q interface {
@@ -306,16 +411,131 @@ func nextTurnNo(ctx context.Context, q interface {
 	return n, err
 }
 
-func (e *Engine) retrieve(ctx context.Context, workspaceID, epochID string, project storage.Project, question string) ([]retrievedChunk, error) {
-	scopeJSON, err := storage.JSON(project.CollectionIDs)
-	if err != nil {
-		return nil, err
+// retrieveHybrid runs the planned subqueries through lexical (FTS) and vector
+// candidate generation, fuses them with weighted RRF, then applies the
+// selection caps. Every candidate is filtered by workspace, active epoch,
+// active document version, scope, lifecycle, and index status inside the SQL
+// projections so no cross-tenant or stale data can enter the candidate pool.
+func (e *Engine) retrieveHybrid(ctx context.Context, workspaceID, epochID string, project storage.Project, plan planner.QueryPlan) ([]retrievedChunk, RetrievalTrace, retrieval.RerankOutcome, error) {
+	subqueries := plan.Subqueries
+	if len(subqueries) == 0 {
+		subqueries = []planner.Subquery{{Query: strings.TrimSpace(plan.Question), Weight: 1, Purpose: "fallback"}}
+	}
+	if len(subqueries) > 5 {
+		subqueries = subqueries[:5]
+	}
+
+	lexicalLists := make([]retrieval.RankedList, 0, len(subqueries))
+	vectorLists := make([]retrieval.RankedList, 0, len(subqueries))
+	for _, sub := range subqueries {
+		query := strings.TrimSpace(sub.Query)
+		if query == "" {
+			continue
+		}
+		weight := sub.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		lexical, err := e.retrieveLexical(ctx, workspaceID, epochID, project, query)
+		if err != nil {
+			return nil, RetrievalTrace{}, retrieval.RerankOutcome{}, err
+		}
+		if len(lexical) > 0 {
+			lexicalLists = append(lexicalLists, retrieval.RankedList{QueryWeight: weight, SourceWeight: 1.0, Source: retrieval.SourceLexical, Candidates: lexical})
+		}
+		vector, err := e.retrieveVector(ctx, workspaceID, epochID, project, query)
+		if err != nil {
+			return nil, RetrievalTrace{}, retrieval.RerankOutcome{}, err
+		}
+		if len(vector) > 0 {
+			vectorLists = append(vectorLists, retrieval.RankedList{QueryWeight: weight, SourceWeight: 1.0, Source: retrieval.SourceVector, Candidates: vector})
+		}
+	}
+
+	lists := append(append([]retrieval.RankedList{}, lexicalLists...), vectorLists...)
+	fused := retrieval.FuseRRF(lists, retrieval.DefaultRRFK)
+	reranked, rerankOutcome := retrieval.RerankOrFallback(ctx, e.Reranker, plan.Question, fused)
+	if strings.TrimSpace(rerankOutcome.Version) == "" {
+		rerankOutcome.Version = e.Config.RerankVersion
+	}
+	if strings.TrimSpace(rerankOutcome.Version) == "" {
+		rerankOutcome.Version = retrieval.FallbackRerankVersion
+	}
+	selected := retrieval.Select(reranked, retrieval.SelectionConfig{
+		MaxChunks: 12, MaxDocuments: 6, PerDocumentCap: 2, TokenBudget: 12000,
+	})
+	trace := traceFromCandidates(fused, reranked, selected)
+	out := make([]retrievedChunk, 0, len(selected))
+	for _, c := range selected {
+		out = append(out, retrievedChunk{
+			ChunkID: c.ChunkID, DocumentID: c.DocumentID, DocumentVersionID: c.DocumentVersionID,
+			Title: c.Title, Content: c.Content, Section: c.Section,
+			PageStart: c.PageStart, PageEnd: c.PageEnd, CharStart: c.CharStart, CharEnd: c.CharEnd,
+			EvidenceType: c.EvidenceType, Score: c.FusedScore,
+		})
+	}
+	return out, trace, rerankOutcome, nil
+}
+
+func traceFromCandidates(fused, reranked, selected []retrieval.Candidate) RetrievalTrace {
+	fusedDocs, fusedChunks := rankedIDs(fused)
+	rerankedDocs, rerankedChunks := rankedIDs(reranked)
+	selectedDocs, selectedChunks := rankedIDs(selected)
+	return RetrievalTrace{
+		CandidateDocuments:  fusedDocs,
+		CandidateChunks:     fusedChunks,
+		PreRerankDocuments:  fusedDocs,
+		PreRerankChunks:     fusedChunks,
+		PostRerankDocuments: rerankedDocs,
+		PostRerankChunks:    rerankedChunks,
+		SelectedDocuments:   selectedDocs,
+		SelectedChunks:      selectedChunks,
+	}
+}
+
+func rankedIDs(candidates []retrieval.Candidate) ([]string, []string) {
+	documents := make([]string, 0, len(candidates))
+	chunks := make([]string, 0, len(candidates))
+	seenDocuments := map[string]bool{}
+	for _, candidate := range candidates {
+		if candidate.DocumentID != "" && !seenDocuments[candidate.DocumentID] {
+			seenDocuments[candidate.DocumentID] = true
+			documents = append(documents, candidate.DocumentID)
+		}
+		if candidate.ChunkID != "" {
+			chunks = append(chunks, candidate.ChunkID)
+		}
+	}
+	return documents, chunks
+}
+
+const lexicalCandidateLimit = 40
+const vectorCandidateLimit = 40
+
+// The deterministic and future providers have different score distributions.
+// These floors keep unrelated documents out of the candidate pool; they are
+// part of the retrieval configuration and must be revisited before production
+// evaluation with a real embedding/rerank provider.
+const lexicalMinSimilarity = 0.30
+const vectorMinSimilarity = 0.05
+
+// retrieveLexical returns the top lexical candidates for one subquery.
+func (e *Engine) retrieveLexical(ctx context.Context, workspaceID, epochID string, project storage.Project, query string) ([]retrieval.Candidate, error) {
+	scopeMode := project.ScopeMode
+	scopeIDs := project.CollectionIDs
+	scopeJSON := "[]"
+	if scopeMode != "all_library" {
+		var err error
+		scopeJSON, err = storage.JSON(scopeIDs)
+		if err != nil {
+			return nil, err
+		}
 	}
 	rows, err := e.Store.Pool().Query(ctx, `
 		SELECT c.id, c.document_id, c.document_version_id, d.title, c.content, c.section,
-			c.page_start, c.page_end, c.char_start, c.char_end, d.evidence_type,
-			(ts_rank_cd(c.search_tsv, plainto_tsquery('english',$3)) +
-			 similarity(c.content,$3) * 0.25) AS score
+			c.page_start, c.page_end, c.char_start, c.char_end, d.evidence_type, c.token_count,
+			(ts_rank_cd(c.search_tsv, plainto_tsquery('english',$5)) +
+			 similarity(c.content,$5) * 0.25) AS score
 		FROM chunks c
 		JOIN index_epoch_documents ied
 			ON ied.epoch_id=c.index_epoch_id
@@ -324,44 +544,184 @@ func (e *Engine) retrieve(ctx context.Context, workspaceID, epochID string, proj
 		JOIN documents d ON d.id=c.document_id AND d.workspace_id=c.workspace_id
 		WHERE c.workspace_id=$1
 			AND c.index_epoch_id=$2
+			AND d.active_version_id=c.document_version_id
 			AND d.removed_at IS NULL
 			AND d.index_status='indexed'
 			AND d.evidence_type IN ('personal_fulltext','structured_abstract')
 			AND (
-				$4='all_library'
+				c.search_tsv @@ plainto_tsquery('english',$5)
+				OR similarity(c.content,$5) >= $6
+			)
+			AND (
+				$3='all_library'
 				OR EXISTS (
 					SELECT 1 FROM document_collections dc
 					WHERE dc.workspace_id=c.workspace_id
 						AND dc.document_id=c.document_id
-						AND dc.collection_id IN (
-							SELECT jsonb_array_elements_text($5::jsonb)
-						)
+						AND dc.collection_id IN (SELECT jsonb_array_elements_text($4::jsonb))
 				)
 			)
 		ORDER BY score DESC, c.document_id, c.ordinal
-		LIMIT 12
-	`, workspaceID, epochID, question, project.ScopeMode, scopeJSON)
+		LIMIT $7
+	`, workspaceID, epochID, scopeMode, scopeJSON, query, lexicalMinSimilarity, lexicalCandidateLimit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []retrievedChunk
+	var out []retrieval.Candidate
 	for rows.Next() {
-		var c retrievedChunk
+		var c retrieval.Candidate
 		var evidenceType string
-		if err := rows.Scan(&c.ChunkID, &c.DocumentID, &c.DocumentVersionID, &c.Title, &c.Content, &c.Section, &c.PageStart, &c.PageEnd, &c.CharStart, &c.CharEnd, &evidenceType, &c.Score); err != nil {
+		var score float64
+		if err := rows.Scan(&c.ChunkID, &c.DocumentID, &c.DocumentVersionID, &c.Title, &c.Content, &c.Section,
+			&c.PageStart, &c.PageEnd, &c.CharStart, &c.CharEnd, &evidenceType, &c.TokenCount, &score); err != nil {
 			return nil, err
 		}
 		c.EvidenceType = domain.EvidenceType(evidenceType)
+		c.Source = retrieval.SourceLexical
+		if score <= 0 {
+			continue
+		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// retrieveVector embeds the subquery and ranks in-scope chunks by cosine
+// similarity using the deterministic local embedding stub. The candidate pool is
+// bounded to the active epoch and scope, and never performs network I/O.
+func (e *Engine) retrieveVector(ctx context.Context, workspaceID, epochID string, project storage.Project, query string) ([]retrieval.Candidate, error) {
+	queryVector := e.Stub.Vector(query)
+	scopeMode := project.ScopeMode
+	scopeIDs := project.CollectionIDs
+	scopeJSON := "[]"
+	if scopeMode != "all_library" {
+		var err error
+		scopeJSON, err = storage.JSON(scopeIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := e.Store.Pool().Query(ctx, `
+		SELECT c.id, c.document_id, c.document_version_id, d.title, c.content, c.section,
+			c.page_start, c.page_end, c.char_start, c.char_end, d.evidence_type, c.token_count,
+			c.embedding::text
+		FROM chunks c
+		JOIN index_epoch_documents ied
+			ON ied.epoch_id=c.index_epoch_id
+			AND ied.document_id=c.document_id
+			AND ied.document_version_id=c.document_version_id
+		JOIN documents d ON d.id=c.document_id AND d.workspace_id=c.workspace_id
+		WHERE c.workspace_id=$1
+			AND c.index_epoch_id=$2
+			AND d.active_version_id=c.document_version_id
+			AND d.removed_at IS NULL
+			AND d.index_status='indexed'
+			AND d.evidence_type IN ('personal_fulltext','structured_abstract')
+			AND (
+				$3='all_library'
+				OR EXISTS (
+					SELECT 1 FROM document_collections dc
+					WHERE dc.workspace_id=c.workspace_id
+						AND dc.document_id=c.document_id
+						AND dc.collection_id IN (SELECT jsonb_array_elements_text($4::jsonb))
+				)
+			)
+	`, workspaceID, epochID, scopeMode, scopeJSON)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pool []scoredCandidate
+	for rows.Next() {
+		var c retrieval.Candidate
+		var evidenceType string
+		var embeddingText string
+		if err := rows.Scan(&c.ChunkID, &c.DocumentID, &c.DocumentVersionID, &c.Title, &c.Content, &c.Section,
+			&c.PageStart, &c.PageEnd, &c.CharStart, &c.CharEnd, &evidenceType, &c.TokenCount, &embeddingText); err != nil {
+			return nil, err
+		}
+		c.EvidenceType = domain.EvidenceType(evidenceType)
+		c.Source = retrieval.SourceVector
+		vec, ok := parseVectorText(embeddingText)
+		if !ok {
+			continue
+		}
+		similarity := cosine(queryVector, vec)
+		if similarity < vectorMinSimilarity {
+			continue
+		}
+		pool = append(pool, scoredCandidate{candidate: c, score: similarity})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	sort.SliceStable(pool, func(i, j int) bool {
+		if pool[i].score != pool[j].score {
+			return pool[i].score > pool[j].score
+		}
+		if pool[i].candidate.DocumentID != pool[j].candidate.DocumentID {
+			return pool[i].candidate.DocumentID < pool[j].candidate.DocumentID
+		}
+		return pool[i].candidate.ChunkID < pool[j].candidate.ChunkID
+	})
+	if len(pool) > vectorCandidateLimit {
+		pool = pool[:vectorCandidateLimit]
+	}
+	out := make([]retrieval.Candidate, 0, len(pool))
+	for _, item := range pool {
+		out = append(out, item.candidate)
+	}
 	return out, nil
 }
 
-func (e *Engine) persistBrief(ctx context.Context, workspaceID string, sess storage.Session, turn storage.Turn, question string, chunks []retrievedChunk) (BriefView, error) {
+// scoredCandidate pairs a retrieval candidate with its vector similarity.
+type scoredCandidate struct {
+	candidate retrieval.Candidate
+	score     float64
+}
+
+// parseVectorText parses the pgvector text representation, e.g. "[0.1,-0.2]".
+func parseVectorText(raw string) ([]float32, bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
+		return nil, false
+	}
+	body := raw[1 : len(raw)-1]
+	if strings.TrimSpace(body) == "" {
+		return nil, false
+	}
+	parts := strings.Split(body, ",")
+	out := make([]float32, 0, len(parts))
+	for _, part := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(part), 32)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, float32(v))
+	}
+	return out, true
+}
+
+// cosine returns the cosine similarity of two equal-length vectors. A mismatch
+// or zero vector yields 0 so it can never outrank a real match.
+func cosine(a, b []float32) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		na += float64(a[i]) * float64(a[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+func (e *Engine) persistBrief(ctx context.Context, workspaceID string, sess storage.Session, turn storage.Turn, question string, chunks []retrievedChunk, rerankOutcome retrieval.RerankOutcome, discoveryResult discovery.ServiceResult) (BriefView, error) {
 	tx, err := e.Store.Pool().BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return BriefView{}, err
@@ -370,110 +730,99 @@ func (e *Engine) persistBrief(ctx context.Context, workspaceID string, sess stor
 
 	briefID := storage.StableID("brief", turn.ID)
 	now := time.Now().UTC()
-	sourceStatus := []SourceStatus{
-		{Source: "zotero", Status: "available"},
-		{Source: "semantic_scholar", Status: "skipped"},
-		{Source: "qwen_web_search", Status: "skipped"},
-	}
+	sourceStatus := sourceStatusesForTurn(rerankOutcome, discoveryResult.SourceStatus)
 	sourceStatusJSON, err := storage.JSON(sourceStatus)
 	if err != nil {
 		return BriefView{}, err
 	}
 
+	// Apply the grounding policy. Evidence identities are derived from the
+	// brief id + chunk id + ordinal so generation and persistence agree. Web
+	// context is persisted as low-confidence background, never as a finding.
+	content := buildBriefContent(briefID, question, chunks)
+
 	evidenceViews := make([]EvidenceView, 0, len(chunks))
 	evidenceRows := make([]evidenceRow, 0, len(chunks))
 	for idx, c := range chunks {
-		evidenceID := storage.StableID("evidence", briefID, c.ChunkID, fmt.Sprint(idx))
-		locator := map[string]any{
-			"index_epoch_id": epochIDString(turn.IndexEpochID), "chunk_id": c.ChunkID,
-			"document_version_id": c.DocumentVersionID, "section": c.Section,
-			"char_start": c.CharStart, "char_end": c.CharEnd,
+		if !persistableEvidenceType(c.EvidenceType) {
+			continue
 		}
-		if c.PageStart != nil {
-			locator["page_start"] = *c.PageStart
-		}
-		if c.PageEnd != nil {
-			locator["page_end"] = *c.PageEnd
-		}
+		evidenceID := evidenceIDFor(briefID, c.ChunkID, idx)
+		locator := locatorFor(c)
+		locator["index_epoch_id"] = turn.IndexEpochID
 		quote := truncate(c.Content, 360)
 		view := EvidenceView{
 			ID: evidenceID, BriefID: briefID, IndexEpochID: turn.IndexEpochID, EvidenceType: string(c.EvidenceType),
-			Title: c.Title, Quote: stringPtr(quote), DocumentID: stringPtr(c.DocumentID),
-			DocumentVersionID: stringPtr(c.DocumentVersionID), ChunkID: stringPtr(c.ChunkID), Locator: locator,
-			Score: c.Score, RetrievedAt: now,
+			Title: c.Title, Quote: stringPtr(quote), Locator: locator, Score: c.Score, RetrievedAt: now,
+		}
+		if c.DocumentID != "" {
+			view.DocumentID = stringPtr(c.DocumentID)
+		}
+		if c.DocumentVersionID != "" {
+			view.DocumentVersionID = stringPtr(c.DocumentVersionID)
+		}
+		if c.ChunkID != "" {
+			view.ChunkID = stringPtr(c.ChunkID)
+		}
+		if c.ExternalWorkID != "" {
+			view.ExternalWorkID = stringPtr(c.ExternalWorkID)
+		}
+		if c.URL != "" {
+			view.URL = stringPtr(c.URL)
 		}
 		evidenceViews = append(evidenceViews, view)
 		evidenceRows = append(evidenceRows, evidenceRow{view: view, chunk: c})
 	}
 
-	summary := ""
-	var summaryClaims []ClaimView
-	var findings []FindingView
-	var openQuestions []string
-	if len(evidenceRows) == 0 {
-		summary = "The current library index does not contain sufficient evidence to answer the question."
-		openQuestions = append(openQuestions, "Import or sync documents with full text or abstracts that cover this question.")
-	} else {
-		summary = fmt.Sprintf("The library index contains %d relevant passage(s) for: %s", len(evidenceRows), question)
-		summaryClaimEvidence := make([]ClaimEvidenceView, 0, len(evidenceRows))
-		for _, row := range evidenceRows {
-			span := truncate(row.chunk.Content, 220)
-			summaryClaimEvidence = append(summaryClaimEvidence, ClaimEvidenceView{
-				EvidenceID: row.view.ID, Stance: string(domain.ClaimSupports), SupportScore: clamp01(row.chunk.Score),
-				EvidenceSpan: stringPtr(span), Locator: row.view.Locator,
-			})
-		}
-		summaryClaims = append(summaryClaims, ClaimView{
-			ClaimID: storage.StableID("claim", briefID, "summary", "1"), ClaimType: string(domain.ClaimSummary),
-			Text: summary, SupportLevel: "sufficient", Confidence: confidenceFor(evidenceRows), VerificationStatus: string(domain.VerificationVerified),
-			ClaimEvidence: summaryClaimEvidence,
-		})
-		for idx, row := range evidenceRows {
-			excerpt := truncate(strings.TrimSpace(row.chunk.Content), 260)
-			text := fmt.Sprintf("Relevant evidence from %s: %s", row.chunk.Title, excerpt)
-			claimID := storage.StableID("claim", briefID, "finding", fmt.Sprint(idx+1))
-			rel := ClaimEvidenceView{
-				EvidenceID: row.view.ID, Stance: string(domain.ClaimSupports), SupportScore: clamp01(row.chunk.Score),
-				EvidenceSpan: stringPtr(excerpt), Locator: row.view.Locator,
-			}
-			findings = append(findings, FindingView{
-				ClaimID: claimID, ClaimType: string(domain.ClaimFinding), Claim: text, SupportLevel: "sufficient",
-				Confidence: confidenceFor(evidenceRows), VerificationStatus: string(domain.VerificationVerified),
-				EvidenceIDs: []string{row.view.ID}, ClaimEvidence: []ClaimEvidenceView{rel},
-			})
+	gaps := gapsFromDiscovery(briefID, discoveryResult.Gaps)
+	for i := range gaps {
+		if gaps[i].ID == "" {
+			gaps[i].ID = storage.StableID("gap", briefID, gaps[i].GapType, fmt.Sprint(i))
 		}
 	}
 
-	findingsJSON, _ := storage.JSON(findings)
-	openJSON, _ := storage.JSON(openQuestions)
+	findingsJSON, _ := storage.JSON(content.Findings)
+	openJSON, _ := storage.JSON(content.OpenQuestions)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO briefs
 			(id,session_id,turn_id,workspace_id,schema_version,summary,findings_json,method_timeline_json,
 			 chronology_json,open_questions_json,source_status_json,index_epoch_id,retrieval_config_version,prompt_version,created_at)
 		VALUES ($1,$2,$3,$4,'1.1',$5,$6::jsonb,'[]'::jsonb,'[]'::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12)
 		ON CONFLICT (turn_id) DO NOTHING
-	`, briefID, sess.ID, turn.ID, workspaceID, summary, findingsJSON, openJSON, sourceStatusJSON,
+	`, briefID, sess.ID, turn.ID, workspaceID, content.Summary, findingsJSON, openJSON, sourceStatusJSON,
 		turn.IndexEpochID, turn.RetrievalConfigVersion, turn.PromptVersion, now); err != nil {
 		return BriefView{}, err
 	}
 	for _, row := range evidenceRows {
 		locatorJSON, _ := storage.JSON(row.view.Locator)
+		sourceMetaJSON, _ := storage.JSON(evidenceSourceMeta(row.chunk))
 		quote := ""
 		if row.view.Quote != nil {
 			quote = *row.view.Quote
 		}
+		docID := nullablePtr(row.view.DocumentID)
+		dvID := nullablePtr(row.view.DocumentVersionID)
+		chunkID := nullablePtr(row.view.ChunkID)
+		externalID := nullablePtr(row.view.ExternalWorkID)
+		url := ""
+		if row.view.URL != nil {
+			url = *row.view.URL
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO evidence
 				(id,brief_id,workspace_id,index_epoch_id,evidence_type,document_id,document_version_id,chunk_id,
-				 title,quote,locator_json,score,retrieved_at,source_meta_json)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,'{"provider":"zotero_web_api_fixture"}'::jsonb)
+				 external_work_id,title,quote,url,locator_json,score,retrieved_at,source_meta_json)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16::jsonb)
 			ON CONFLICT (id) DO NOTHING
-		`, row.view.ID, briefID, workspaceID, turn.IndexEpochID, row.view.EvidenceType, row.view.DocumentID, row.view.DocumentVersionID,
-			row.view.ChunkID, row.view.Title, quote, locatorJSON, row.view.Score, now); err != nil {
+		`, row.view.ID, briefID, workspaceID, turn.IndexEpochID, row.view.EvidenceType, docID, dvID,
+			chunkID, externalID, row.view.Title, quote, url, locatorJSON, row.view.Score, now, sourceMetaJSON); err != nil {
 			return BriefView{}, err
 		}
 	}
-	if err := e.persistClaims(ctx, tx, workspaceID, briefID, summaryClaims, findings); err != nil {
+	if err := e.persistClaims(ctx, tx, workspaceID, briefID, content.SummaryClaims, content.Findings); err != nil {
+		return BriefView{}, err
+	}
+	if err := persistGapsTx(ctx, tx, workspaceID, briefID, gaps); err != nil {
 		return BriefView{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -483,10 +832,121 @@ func (e *Engine) persistBrief(ctx context.Context, workspaceID string, sess stor
 	return BriefView{
 		ID: briefID, SessionID: sess.ID, TurnID: turn.ID, SchemaVersion: "1.1", IndexEpochID: turn.IndexEpochID,
 		RetrievalConfigVersion: turn.RetrievalConfigVersion, PromptVersion: turn.PromptVersion,
-		Summary: summary, SummaryClaims: summaryClaims, Findings: findings,
-		MethodTimeline: []map[string]any{}, Chronology: []map[string]any{}, Gaps: []GapView{},
-		OpenQuestions: openQuestions, Citations: evidenceViews, SourceStatus: sourceStatus, CreatedAt: now,
+		Summary: content.Summary, SummaryClaims: content.SummaryClaims, Findings: content.Findings,
+		MethodTimeline: []map[string]any{}, Chronology: []map[string]any{}, Gaps: gaps,
+		OpenQuestions: content.OpenQuestions, Citations: evidenceViews, SourceStatus: sourceStatus, CreatedAt: now,
 	}, nil
+}
+
+func persistableEvidenceType(t domain.EvidenceType) bool {
+	return t == domain.EvidencePersonalFulltext || t == domain.EvidenceStructuredAbstract || t == domain.EvidenceWebContext
+}
+
+// evidenceSourceMeta records provenance for one persisted evidence row without
+// leaking private content or provider secrets.
+func evidenceSourceMeta(c retrievedChunk) map[string]any {
+	meta := map[string]any{"provider": "zotero_web_api"}
+	switch c.EvidenceType {
+	case domain.EvidenceStructuredAbstract:
+		meta["provider"] = "structured_discovery"
+		if c.Provider != "" {
+			meta["source"] = c.Provider
+		}
+		if c.ExternalWorkID != "" {
+			meta["external_work_id"] = c.ExternalWorkID
+		}
+	case domain.EvidenceWebContext:
+		meta["provider"] = "qwen_web_search"
+		if c.Provider != "" {
+			meta["provider"] = c.Provider
+		}
+		if c.Model != "" {
+			meta["model"] = c.Model
+		}
+		if c.URL != "" {
+			meta["url"] = c.URL
+		}
+	}
+	return meta
+}
+
+// persistGapsTx writes discovery gaps inside the brief transaction. Repeat
+// writes are idempotent on the stable gap id.
+func persistGapsTx(ctx context.Context, tx pgx.Tx, workspaceID, briefID string, gaps []GapView) error {
+	for i, g := range gaps {
+		id := g.ID
+		if id == "" {
+			id = storage.StableID("gap", briefID, g.GapType, fmt.Sprint(i))
+		}
+		rationale := g.Rationale
+		if rationale == nil {
+			rationale = map[string]any{}
+		}
+		rationaleJSON, _ := storage.JSON(rationale)
+		externalWorkID := ""
+		if g.ExternalWorkID != nil {
+			externalWorkID = *g.ExternalWorkID
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO gaps
+				(id,brief_id,workspace_id,gap_type,missing_relative_to,explanation,external_work_id,rationale_json,score)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)
+			ON CONFLICT (id) DO UPDATE SET
+				explanation = EXCLUDED.explanation,
+				external_work_id = EXCLUDED.external_work_id,
+				rationale_json = EXCLUDED.rationale_json,
+				score = EXCLUDED.score
+		`, id, briefID, workspaceID, g.GapType, g.MissingRelativeTo, g.Explanation, externalWorkID, rationaleJSON, g.Score); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func nullablePtr(v *string) any {
+	if v == nil || *v == "" {
+		return nil
+	}
+	return *v
+}
+
+// gapsFromDiscovery maps detected discovery gaps onto the persisted view.
+func gapsFromDiscovery(briefID string, in []discovery.Gap) []GapView {
+	out := make([]GapView, 0, len(in))
+	for i, g := range in {
+		workID := g.Work.ID
+		view := GapView{
+			ID:                storage.StableID("gap", briefID, string(g.Type), workID, fmt.Sprint(i)),
+			GapType:           string(g.Type),
+			MissingRelativeTo: string(g.MissingRelativeTo),
+			Explanation:       g.Rationale,
+			Score:             gapScore(g),
+			Rationale: map[string]any{
+				"work_title":     g.Work.Title,
+				"work_year":      g.Work.Year,
+				"citation_count": g.Work.CitationCount,
+			},
+		}
+		if workID != "" {
+			id := workID
+			view.ExternalWorkID = &id
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
+// gapScore is a deterministic, non-authoritative ordering hint. It never
+// substitutes for the rationale fields and is never used to override stance.
+func gapScore(g discovery.Gap) float64 {
+	base := 0.5
+	switch g.Type {
+	case discovery.GapCanonical:
+		base = 0.9
+	case discovery.GapLatestProgress:
+		base = 0.6
+	}
+	return base
 }
 
 func (e *Engine) persistClaims(ctx context.Context, tx pgx.Tx, workspaceID, briefID string, summaryClaims []ClaimView, findings []FindingView) error {
@@ -532,22 +992,37 @@ func (e *Engine) persistClaim(ctx context.Context, tx pgx.Tx, workspaceID, brief
 	return nil
 }
 
+// event appends a durable SSE event with a monotonic per-session sequence. The
+// session row is locked inside the transaction so concurrent writers cannot pick
+// the same sequence and silently drop an event through the unique constraint.
 func (e *Engine) event(ctx context.Context, workspaceID, sessionID, turnID, eventType string, data map[string]any) error {
-	var seq int64
-	if err := e.Store.Pool().QueryRow(ctx, `SELECT COALESCE(max(seq),0)+1 FROM query_events WHERE session_id=$1`, sessionID).Scan(&seq); err != nil {
-		return err
-	}
 	dataJSON, err := storage.JSON(data)
 	if err != nil {
 		return err
 	}
+	tx, err := e.Store.Pool().BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var locked string
+	if err := tx.QueryRow(ctx, `SELECT id FROM query_sessions WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, sessionID).Scan(&locked); err != nil {
+		return err
+	}
+	var seq int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(max(seq),0)+1 FROM query_events WHERE workspace_id=$1 AND session_id=$2`, workspaceID, sessionID).Scan(&seq); err != nil {
+		return err
+	}
 	id := storage.StableID("event", sessionID, fmt.Sprint(seq), eventType)
-	_, err = e.Store.Pool().Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO query_events (id,session_id,turn_id,workspace_id,seq,type,data_json)
 		VALUES ($1,$2,NULLIF($3,''),$4,$5,$6,$7::jsonb)
 		ON CONFLICT (session_id, seq) DO NOTHING
-	`, id, sessionID, turnID, workspaceID, seq, eventType, dataJSON)
-	return err
+	`, id, sessionID, turnID, workspaceID, seq, eventType, dataJSON); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (e *Engine) failTurn(ctx context.Context, workspaceID, turnID string, cause error) error {
@@ -588,7 +1063,10 @@ func (e *Engine) GetBriefByID(ctx context.Context, workspaceID, briefID string) 
 	_ = json.Unmarshal(sourceRaw, &out.SourceStatus)
 	out.MethodTimeline = []map[string]any{}
 	out.Chronology = []map[string]any{}
-	out.Gaps = []GapView{}
+	out.Gaps, err = e.listGaps(ctx, workspaceID, briefID)
+	if err != nil {
+		return BriefView{}, err
+	}
 	out.SummaryClaims, err = e.listClaims(ctx, workspaceID, briefID, "summary")
 	if err != nil {
 		return BriefView{}, err
@@ -663,10 +1141,42 @@ func (e *Engine) listClaimEvidence(ctx context.Context, workspaceID, claimID str
 	return out, rows.Err()
 }
 
+// ListGaps returns the persisted, workspace-scoped gaps for a brief including
+// the external work reference, rationale and score.
+func (e *Engine) ListGaps(ctx context.Context, workspaceID, briefID string) ([]GapView, error) {
+	return e.listGaps(ctx, workspaceID, briefID)
+}
+
+func (e *Engine) listGaps(ctx context.Context, workspaceID, briefID string) ([]GapView, error) {
+	rows, err := e.Store.Pool().Query(ctx, `
+		SELECT id, gap_type, missing_relative_to, explanation, NULLIF(external_work_id,''), rationale_json, score
+		FROM gaps WHERE workspace_id=$1 AND brief_id=$2
+		ORDER BY created_at, id
+	`, workspaceID, briefID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GapView{}
+	for rows.Next() {
+		var g GapView
+		var externalID *string
+		var rationaleRaw []byte
+		if err := rows.Scan(&g.ID, &g.GapType, &g.MissingRelativeTo, &g.Explanation, &externalID, &rationaleRaw, &g.Score); err != nil {
+			return nil, err
+		}
+		g.ExternalWorkID = externalID
+		g.Rationale = map[string]any{}
+		_ = json.Unmarshal(rationaleRaw, &g.Rationale)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
 func (e *Engine) ListEvidence(ctx context.Context, workspaceID, briefID string) ([]EvidenceView, error) {
 	rows, err := e.Store.Pool().Query(ctx, `
 		SELECT id,brief_id,index_epoch_id,evidence_type,title,quote,url,document_id,document_version_id,
-			chunk_id,locator_json,score,retrieved_at
+			chunk_id,external_work_id,locator_json,score,retrieved_at
 		FROM evidence WHERE workspace_id=$1 AND brief_id=$2
 		ORDER BY score DESC, id
 	`, workspaceID, briefID)
@@ -677,12 +1187,12 @@ func (e *Engine) ListEvidence(ctx context.Context, workspaceID, briefID string) 
 	var out []EvidenceView
 	for rows.Next() {
 		var ev EvidenceView
-		var quote, url, docID, dvID, chunkID *string
+		var quote, url, docID, dvID, chunkID, externalID *string
 		var locatorRaw []byte
-		if err := rows.Scan(&ev.ID, &ev.BriefID, &ev.IndexEpochID, &ev.EvidenceType, &ev.Title, &quote, &url, &docID, &dvID, &chunkID, &locatorRaw, &ev.Score, &ev.RetrievedAt); err != nil {
+		if err := rows.Scan(&ev.ID, &ev.BriefID, &ev.IndexEpochID, &ev.EvidenceType, &ev.Title, &quote, &url, &docID, &dvID, &chunkID, &externalID, &locatorRaw, &ev.Score, &ev.RetrievedAt); err != nil {
 			return nil, err
 		}
-		ev.Quote, ev.URL, ev.DocumentID, ev.DocumentVersionID, ev.ChunkID = quote, url, docID, dvID, chunkID
+		ev.Quote, ev.URL, ev.DocumentID, ev.DocumentVersionID, ev.ChunkID, ev.ExternalWorkID = quote, url, docID, dvID, chunkID, externalID
 		ev.Locator = map[string]any{}
 		_ = json.Unmarshal(locatorRaw, &ev.Locator)
 		out = append(out, ev)
@@ -694,15 +1204,16 @@ func (e *Engine) GetEvidence(ctx context.Context, workspaceID, evidenceID string
 	var ev EvidenceView
 	var quote, url, docID, dvID, chunkID *string
 	var locatorRaw []byte
+	var externalID *string
 	err := e.Store.Pool().QueryRow(ctx, `
 		SELECT id,brief_id,index_epoch_id,evidence_type,title,quote,url,document_id,document_version_id,
-			chunk_id,locator_json,score,retrieved_at
+			chunk_id,external_work_id,locator_json,score,retrieved_at
 		FROM evidence WHERE workspace_id=$1 AND id=$2
-	`, workspaceID, evidenceID).Scan(&ev.ID, &ev.BriefID, &ev.IndexEpochID, &ev.EvidenceType, &ev.Title, &quote, &url, &docID, &dvID, &chunkID, &locatorRaw, &ev.Score, &ev.RetrievedAt)
+	`, workspaceID, evidenceID).Scan(&ev.ID, &ev.BriefID, &ev.IndexEpochID, &ev.EvidenceType, &ev.Title, &quote, &url, &docID, &dvID, &chunkID, &externalID, &locatorRaw, &ev.Score, &ev.RetrievedAt)
 	if err != nil {
 		return EvidenceView{}, err
 	}
-	ev.Quote, ev.URL, ev.DocumentID, ev.DocumentVersionID, ev.ChunkID = quote, url, docID, dvID, chunkID
+	ev.Quote, ev.URL, ev.DocumentID, ev.DocumentVersionID, ev.ChunkID, ev.ExternalWorkID = quote, url, docID, dvID, chunkID, externalID
 	ev.Locator = map[string]any{}
 	_ = json.Unmarshal(locatorRaw, &ev.Locator)
 	return ev, nil

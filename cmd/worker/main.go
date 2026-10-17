@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"research-scout/internal/app"
 	"research-scout/internal/config"
 	"research-scout/internal/domain"
 	"research-scout/internal/embedding"
@@ -30,7 +31,7 @@ func main() {
 
 func run() error {
 	if len(os.Args) < 2 {
-		return fmt.Errorf("usage: worker <migrate|seed|import-fixture|smoke-stage0|eval-rag|sync-zotero|sync-status|purge-lifecycle> [flags]")
+		return fmt.Errorf("usage: worker <migrate|seed|import-fixture|smoke-stage0|discovery-smoke|eval-rag|sync-zotero|sync-status|purge-lifecycle> [flags]")
 	}
 	command := os.Args[1]
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -41,6 +42,8 @@ func run() error {
 	syncMode := fs.String("mode", "full", "sync mode: full or incremental")
 	libraryID := fs.String("library-id", env("ZOTERO_LIBRARY_ID", ""), "Zotero user/library id (optional)")
 	apiKeyFile := fs.String("api-key-file", env("ZOTERO_API_KEY_FILE", ""), "path to a chmod 600 file holding the Zotero API key")
+	smokeTopic := fs.String("topic", "reciprocal rank fusion hybrid retrieval", "topic for one bounded discovery-smoke search")
+	smokeWeb := fs.Bool("web", false, "also make one bounded provider-native web search request")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -57,6 +60,13 @@ func run() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
+	// discovery-smoke is a read-only, cost-bounded provider check: it needs no
+	// database and never persists results, so it runs before the store opens.
+	if command == "discovery-smoke" {
+		return printJSON(runDiscoverySmoke(ctx, cfg, *smokeTopic, *smokeWeb), nil)
+	}
+
 	store, err := storage.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
@@ -94,7 +104,7 @@ func run() error {
 		if *datasetPath == "" {
 			*datasetPath = cfg.RAGEvalDataset
 		}
-		engine := &query.Engine{Store: store, Config: query.EngineConfig{PlannerVersion: cfg.PlannerVersion, RetrievalConfigVersion: cfg.RetrievalConfigVersion, PromptVersion: cfg.PromptVersion}, Stub: embedding.NewStub(cfg)}
+		engine := app.NewEngine(store, cfg)
 		result, err := eval.Run(ctx, store, engine, cfg, *datasetPath, *kind)
 		if err != nil {
 			return err
@@ -147,7 +157,7 @@ func smoke(ctx context.Context, store *storage.Store, cfg config.Config, migrati
 	}); err != nil {
 		return nil, err
 	}
-	engine := &query.Engine{Store: store, Config: query.EngineConfig{PlannerVersion: cfg.PlannerVersion, RetrievalConfigVersion: cfg.RetrievalConfigVersion, PromptVersion: cfg.PromptVersion}, Stub: embedding.NewStub(cfg)}
+	engine := app.NewEngine(store, cfg)
 	const question = "hybrid retrieval reciprocal rank fusion"
 	sessionID := storage.StableID("session", cfg.DevWorkspaceID, projectID, "stage0-smoke", question)
 	result, err := reusableSmokeResult(ctx, store, engine, cfg, projectID, sessionID, imported.EpochID, question)

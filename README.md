@@ -55,6 +55,21 @@ make eval-rag
 make verify
 ```
 
+真实外部来源（Semantic Scholar / OpenAlex / Qwen 联网搜索）默认关闭，不参与 CI。
+需要人工确认真实调用时，用成本受控的一次性 smoke：每个来源最多 1 次请求，只输出状态与公开计数，
+不落库、不打印任何密钥（联网搜索需显式加 `-web`）。
+
+```bash
+# 只查结构化来源（无需数据库）
+go run ./cmd/worker discovery-smoke
+# 额外做 1 次联网搜索（需 DASHSCOPE_API_KEY 等已配置）
+go run ./cmd/worker discovery-smoke -web
+```
+
+真实来源只在确认要调用时才通过环境变量开启：`S2_API_KEY`、`OPENALEX_EMAIL`、
+`DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`、`QWEN_SEARCH_MODEL`，以及 `DISCOVERY_ENABLED`、
+`WEB_SEARCH_ENABLED`。
+
 启动 API：
 
 ```bash
@@ -71,7 +86,12 @@ go run ./cmd/api
 
 停止本地依赖：`make db-down`（保留数据卷）；需要彻底重置时用 `docker compose down -v`。
 
-## 阶段 0 的边界
+## 阶段 0–3 的边界
+
+阶段 0（本地闭环）、阶段 1（Zotero Web API 同步与生命周期）、阶段 2（个人文库 RAG：检索规划、
+混合检索与 rerank 回退、scope 管理、可追溯 Brief 与生命周期路由）、阶段 3（外部发现：Semantic Scholar
+与 OpenAlex 归一化与去重、三类缺口判定、`gap_fill` / `landscape` 模式、Provider-native Web Search 边界、
+来源状态显式降级与冲突证据保留）均已实现，可离线复现。
 
 已实现（可用 `make verify`/`make smoke-stage0` 复现）：
 
@@ -83,10 +103,12 @@ go run ./cmd/api
 - 本地身份适配器、`/healthz`、`/readyz`、`/metrics`、统一错误模型和请求 ID。
 - OpenAPI 3.1 路由契约测试、golden set、机器可读 RAG 评测报告与 hard gate。
 
-尚未实现（后续阶段，不在阶段 0 验收范围）：
+尚未实现（后续阶段）：
 
-- 真实 Zotero Web API 同步、OAuth、`?since=` 增量与 tombstone 清理。
-- 真实 LLM / Embedding / Rerank / Semantic Scholar / OpenAlex / 联网搜索 Provider。
+- Zotero OAuth 1.0a（开发期使用只读 API Key；OAuth 流程留待试点前 ADR）。
+- 真实 LLM 生成层（Brief 仍用确定性证据抽取）、真实 Embedding 与 Rerank Provider 接线。
+- 联网搜索的真实凭据联通（现有 DashScope 凭据仅覆盖自建 rerank 端点，返回 401，显式降级）。
+- 引用图二次召回（`/discovery/works/{id}/citations` 目前只做只读透传）。
 - Web 工作台（`web/` 仍为空壳）、研究简报 UI、SSE 前端消费。
 - 多租户权限、管理员审计、30 天清理调度、备份恢复与生产部署（Docker Compose 单机）。
 

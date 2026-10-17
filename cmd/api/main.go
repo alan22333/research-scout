@@ -11,11 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"research-scout/internal/app"
 	"research-scout/internal/config"
-	"research-scout/internal/embedding"
 	"research-scout/internal/httpserver"
 	"research-scout/internal/identity"
-	"research-scout/internal/query"
 	"research-scout/internal/storage"
 )
 
@@ -52,7 +51,7 @@ func run() error {
 		}
 	}
 	adapter := identity.LocalAdapter{ActorID: cfg.DevActorID, WorkspaceID: cfg.DevWorkspaceID, AllowHeaders: cfg.DevAllowActorHeader && (cfg.AppEnv == "local" || cfg.AppEnv == "test")}
-	engine := &query.Engine{Store: store, Config: query.EngineConfig{PlannerVersion: cfg.PlannerVersion, RetrievalConfigVersion: cfg.RetrievalConfigVersion, PromptVersion: cfg.PromptVersion}, Stub: embedding.NewStub(cfg)}
+	engine := app.NewEngine(store, cfg)
 	router := httpserver.NewRouter(cfg, store, engine, adapter)
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second}
 	errCh := make(chan error, 1)

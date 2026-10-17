@@ -605,6 +605,10 @@ paths:
           schema:
             type: array
             items: {type: string, enum: [semantic_scholar, openalex]}
+        - name: mode
+          in: query
+          description: "Retrieval mode gate; my_library is rejected because it never calls external sources."
+          schema: {type: string, enum: [gap_fill, landscape], default: gap_fill}
         - $ref: '#/components/parameters/Limit'
       responses:
         '4XX': {$ref: '#/components/responses/Problem'}
@@ -623,7 +627,7 @@ paths:
         - name: externalWorkId
           in: path
           required: true
-          schema: {type: string, format: uuid}
+          schema: {type: string, minLength: 1}
       responses:
         '4XX': {$ref: '#/components/responses/Problem'}
         '200':
@@ -641,7 +645,7 @@ paths:
         - name: externalWorkId
           in: path
           required: true
-          schema: {type: string, format: uuid}
+          schema: {type: string, minLength: 1}
       responses:
         '4XX': {$ref: '#/components/responses/Problem'}
         '200':
@@ -985,7 +989,7 @@ components:
       type: object
       required: [source, status]
       properties:
-        source: {type: string, enum: [zotero, semantic_scholar, openalex, qwen_web_search]}
+        source: {type: string, enum: [zotero, rerank, semantic_scholar, openalex, qwen_web_search]}
         status: {type: string, enum: [available, degraded, unavailable, skipped]}
         degraded_reason: {type: [string, 'null']}
         request_id: {type: [string, 'null']}
@@ -1003,7 +1007,7 @@ components:
         document_id: {type: [string, 'null'], format: uuid}
         document_version_id: {type: [string, 'null'], format: uuid}
         chunk_id: {type: [string, 'null'], format: uuid}
-        external_work_id: {type: [string, 'null'], format: uuid}
+        external_work_id: {type: [string, 'null'], minLength: 1}
         locator: {type: object, additionalProperties: true}
         score: {type: number}
         retrieved_at: {type: string, format: date-time}
@@ -1054,7 +1058,7 @@ components:
         id: {type: string, format: uuid}
         gap_type: {type: string, enum: [canonical, related_method, latest_progress]}
         missing_relative_to: {type: string, enum: [personal_library, current_scope, external_only]}
-        external_work_id: {type: [string, 'null'], format: uuid}
+        external_work_id: {type: [string, 'null'], minLength: 1}
         document_id: {type: [string, 'null'], format: uuid}
         explanation: {type: string}
         score: {type: number}

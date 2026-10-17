@@ -15,7 +15,17 @@ func TestReportContainsVersionAndHardGateFields(t *testing.T) {
 	if err := json.Unmarshal(b, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"dataset_version", "retrieval_config_version", "embedding_version", "index_epoch_id", "hard_gate_failures"} {
+	for _, key := range []string{
+		"dataset_version",
+		"schema_version",
+		"planner_version",
+		"retrieval_config_version",
+		"embedding_version",
+		"index_epoch_id",
+		"rerank_version",
+		"prompt_version",
+		"hard_gate_failures",
+	} {
 		if _, ok := decoded[key]; !ok {
 			t.Fatalf("report missing %s", key)
 		}

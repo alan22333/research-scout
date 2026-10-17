@@ -2,11 +2,67 @@ version: rag-golden-v1
 questions:
   - id: q-hybrid-retrieval
     intent: mechanism_comparison
+    mode: my_library
     question: hybrid retrieval reciprocal rank fusion
     expected_terms: [reciprocal rank fusion, citation traceability]
     min_evidence: 1
+    relevant_document_ids:
+      - doc-6fcef7910a83088a4099cee0
+    relevant_chunk_ids:
+      - chunk-fd29563f2a8a56fd0bfef88c3f513de9
+      - chunk-54e88fd9c08653f014d30b7402e37159
+    expected_evidence_types: [personal_fulltext]
+    expected_claims:
+      - reciprocal rank fusion merges sparse and dense candidate lists
+    unanswerable: false
+    notes: Full-text mechanism question with citation traceability labels.
   - id: q-grounding
-    intent: find_gap
+    intent: library_qa
+    mode: my_library
     question: grounded citations retrieval coverage RAG benchmark
     expected_terms: [grounded citations, retrieval coverage]
     min_evidence: 1
+    relevant_document_ids:
+      - doc-2a335886fb374a730650e5df
+    relevant_chunk_ids:
+      - chunk-f3fd5fc1e898096c6adbfabad97378e1
+    expected_evidence_types: [structured_abstract]
+    expected_claims:
+      - the benchmark evaluates grounded citations and retrieval coverage
+    unanswerable: false
+    notes: Abstract-level answer must remain partial and must not be marked verified.
+  - id: q-gap-fill-method
+    intent: gap_fill
+    mode: gap_fill
+    question: methods related to hybrid retrieval fusion that may be missing from my library
+    expected_evidence_types: [personal_fulltext, structured_abstract]
+    expected_gap_types: [related_method]
+    min_evidence: 0
+    unanswerable: false
+    notes: Stage 3 gap-fill intent; external sources degrade gracefully when discovery is offline.
+  - id: q-landscape-survey
+    intent: landscape
+    mode: landscape
+    question: how does the field structure retrieval grounding and citation coverage
+    expected_evidence_types: [personal_fulltext, structured_abstract, web_context]
+    expected_gap_types: [canonical]
+    min_evidence: 0
+    unanswerable: false
+    notes: Stage 3 landscape intent; web search only runs on demand after structured coverage.
+  - id: q-temporal-recent
+    intent: temporal
+    mode: landscape
+    question: recent progress in retrieval augmented generation since 2024
+    expected_evidence_types: [structured_abstract, web_context]
+    expected_gap_types: [latest_progress]
+    min_evidence: 0
+    unanswerable: false
+    notes: Stage 3 temporal intent; expects recency gaps when the personal library is stale.
+  - id: q-conflict-check
+    intent: conflict_check
+    mode: gap_fill
+    question: do sources disagree about whether reciprocal rank fusion improves retrieval quality
+    expected_evidence_types: [personal_fulltext, structured_abstract]
+    min_evidence: 0
+    unanswerable: false
+    notes: Stage 3 conflict intent; a conflict brief must keep both stances without voting by citation count.

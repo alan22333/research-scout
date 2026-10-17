@@ -49,6 +49,9 @@ func TestContractImplementedRoutesExistInOpenAPI(t *testing.T) {
 		{http.MethodGet, "/api/v1/briefs/:briefId/evidence"},
 		{http.MethodGet, "/api/v1/briefs/:briefId/gaps"},
 		{http.MethodGet, "/api/v1/evidence/:evidenceId"},
+		{http.MethodGet, "/api/v1/discovery/search"},
+		{http.MethodGet, "/api/v1/discovery/works/:externalWorkId"},
+		{http.MethodGet, "/api/v1/discovery/works/:externalWorkId/citations"},
 	}
 
 	registered := map[string]bool{}

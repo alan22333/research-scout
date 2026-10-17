@@ -10,6 +10,19 @@ const (
 	RetrievalModeLandscape RetrievalMode = "landscape"
 )
 
+type QueryIntent string
+
+const (
+	IntentKnownItem        QueryIntent = "known_item"
+	IntentLibraryQA        QueryIntent = "library_qa"
+	IntentMethodComparison QueryIntent = "method_comparison"
+	IntentGapFill          QueryIntent = "gap_fill"
+	IntentLandscape        QueryIntent = "landscape"
+	IntentTemporal         QueryIntent = "temporal"
+	IntentConflictCheck    QueryIntent = "conflict_check"
+	IntentUnanswerable     QueryIntent = "unanswerable"
+)
+
 type EvidenceType string
 
 const (
@@ -21,11 +34,11 @@ const (
 type IndexStatus string
 
 const (
-	IndexPending       IndexStatus = "pending"
-	IndexIndexed       IndexStatus = "indexed"
-	IndexMetadataOnly  IndexStatus = "metadata_only"
-	IndexFailed        IndexStatus = "failed"
-	IndexSkipped       IndexStatus = "skipped"
+	IndexPending      IndexStatus = "pending"
+	IndexIndexed      IndexStatus = "indexed"
+	IndexMetadataOnly IndexStatus = "metadata_only"
+	IndexFailed       IndexStatus = "failed"
+	IndexSkipped      IndexStatus = "skipped"
 )
 
 type IndexEpochStatus string
@@ -86,77 +99,77 @@ const (
 )
 
 type Document struct {
-	ID             string
-	WorkspaceID    string
-	ZoteroItemKey  string
-	ItemType       string
-	Title          string
-	Abstract       string
-	Year           int
-	Venue          string
-	DOINormalized  string
+	ID              string
+	WorkspaceID     string
+	ZoteroItemKey   string
+	ItemType        string
+	Title           string
+	Abstract        string
+	Year            int
+	Venue           string
+	DOINormalized   string
 	ActiveVersionID string
-	IndexStatus    IndexStatus
-	EvidenceType   *EvidenceType
-	ContentHash    string
-	RemovedAt      *time.Time
+	IndexStatus     IndexStatus
+	EvidenceType    *EvidenceType
+	ContentHash     string
+	RemovedAt       *time.Time
 }
 
 type DocumentVersion struct {
-	ID           string
-	DocumentID   string
-	WorkspaceID  string
-	VersionNo    int
-	SourceKind   string
-	Fulltext     string
-	Abstract     string
-	ContentHash  string
-	PublishedAt  time.Time
+	ID          string
+	DocumentID  string
+	WorkspaceID string
+	VersionNo   int
+	SourceKind  string
+	Fulltext    string
+	Abstract    string
+	ContentHash string
+	PublishedAt time.Time
 }
 
 type Chunk struct {
-	ID               string
-	IndexEpochID     string
+	ID                string
+	IndexEpochID      string
 	DocumentVersionID string
-	DocumentID       string
-	WorkspaceID      string
-	Ordinal          int
-	Section          string
-	PageStart        *int
-	PageEnd          *int
-	CharStart        int
-	CharEnd          int
-	Content          string
-	TokenCount       int
-	EmbeddingVersion string
-	Score            float64
+	DocumentID        string
+	WorkspaceID       string
+	Ordinal           int
+	Section           string
+	PageStart         *int
+	PageEnd           *int
+	CharStart         int
+	CharEnd           int
+	Content           string
+	TokenCount        int
+	EmbeddingVersion  string
+	Score             float64
 }
 
 type Evidence struct {
-	ID               string
-	BriefID          string
-	WorkspaceID      string
-	IndexEpochID     string
-	EvidenceType     EvidenceType
-	DocumentID       string
+	ID                string
+	BriefID           string
+	WorkspaceID       string
+	IndexEpochID      string
+	EvidenceType      EvidenceType
+	DocumentID        string
 	DocumentVersionID string
-	ChunkID          string
-	Title            string
-	URL              string
-	Quote            string
-	Locator          map[string]any
-	Score            float64
-	RetrievedAt      time.Time
+	ChunkID           string
+	Title             string
+	URL               string
+	Quote             string
+	Locator           map[string]any
+	Score             float64
+	RetrievedAt       time.Time
 }
 
 type ClaimEvidence struct {
-	ClaimID       string
-	EvidenceID    string
-	WorkspaceID   string
-	Stance        ClaimStance
-	SupportScore  float64
-	EvidenceSpan  string
-	Locator       map[string]any
+	ClaimID      string
+	EvidenceID   string
+	WorkspaceID  string
+	Stance       ClaimStance
+	SupportScore float64
+	EvidenceSpan string
+	Locator      map[string]any
 }
 
 type Claim struct {

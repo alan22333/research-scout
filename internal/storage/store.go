@@ -135,18 +135,33 @@ func (s *Store) HasActiveEpoch(ctx context.Context, workspaceID string) (bool, e
 	return exists, err
 }
 
-func (s *Store) ActiveEpochID(ctx context.Context, workspaceID string) (string, error) {
-	var id string
+type EpochMetadata struct {
+	ID                     string
+	EmbeddingVersion       string
+	RetrievalConfigVersion string
+}
+
+func (s *Store) ActiveEpochMetadata(ctx context.Context, workspaceID string) (EpochMetadata, error) {
+	var out EpochMetadata
 	err := s.pool.QueryRow(ctx, `
-		SELECT id FROM index_epochs
+		SELECT id, embedding_version, retrieval_config_version
+		FROM index_epochs
 		WHERE workspace_id = $1 AND status = 'active' AND retired_at IS NULL
 		ORDER BY published_at DESC NULLS LAST
 		LIMIT 1
-	`, workspaceID).Scan(&id)
+	`, workspaceID).Scan(&out.ID, &out.EmbeddingVersion, &out.RetrievalConfigVersion)
+	if err != nil {
+		return EpochMetadata{}, err
+	}
+	return out, nil
+}
+
+func (s *Store) ActiveEpochID(ctx context.Context, workspaceID string) (string, error) {
+	epoch, err := s.ActiveEpochMetadata(ctx, workspaceID)
 	if err != nil {
 		return "", err
 	}
-	return id, nil
+	return epoch.ID, nil
 }
 
 type Project struct {
@@ -264,12 +279,35 @@ func (s *Store) ListProjects(ctx context.Context, workspaceID string) ([]Project
 	return out, rows.Err()
 }
 
+// UpdateProjectScope validates and persists a project's default scope. A
+// selected scope must be non-empty and reference collections that belong to the
+// workspace and are not deleted. all_library clears collection ids. Validation
+// failures never touch the database.
 func (s *Store) UpdateProjectScope(ctx context.Context, workspaceID, projectID, scopeMode string, collectionIDs []string) (Project, error) {
 	if scopeMode != "all_library" && scopeMode != "selected_collections" {
 		return Project{}, fmt.Errorf("invalid scope_mode")
 	}
-	if scopeMode == "all_library" {
+	switch scopeMode {
+	case "all_library":
 		collectionIDs = []string{}
+	case "selected_collections":
+		ids, err := normalizeCollectionIDs(collectionIDs)
+		if err != nil {
+			return Project{}, err
+		}
+		if len(ids) == 0 {
+			return Project{}, ErrScopeEmpty
+		}
+		visible, err := s.visibleCollectionIDs(ctx, workspaceID, ids)
+		if err != nil {
+			return Project{}, err
+		}
+		for _, id := range ids {
+			if !visible[id] {
+				return Project{}, ErrForbidden
+			}
+		}
+		collectionIDs = ids
 	}
 	scopeJSON, err := JSON(collectionIDs)
 	if err != nil {
@@ -287,6 +325,164 @@ func (s *Store) UpdateProjectScope(ctx context.Context, workspaceID, projectID, 
 		return Project{}, pgx.ErrNoRows
 	}
 	return s.GetProject(ctx, workspaceID, projectID)
+}
+
+func normalizeCollectionIDs(ids []string) ([]string, error) {
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			return nil, fmt.Errorf("collection id must not be empty")
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// visibleCollectionIDs returns the subset of ids that belong to the workspace
+// and are not soft-deleted.
+func (s *Store) visibleCollectionIDs(ctx context.Context, workspaceID string, ids []string) (map[string]bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id FROM collections
+		WHERE workspace_id=$1 AND is_deleted=false AND id = ANY($2)
+	`, workspaceID, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// DeleteProject soft-deletes a project and starts its 30-day purge countdown.
+func (s *Store) DeleteProject(ctx context.Context, workspaceID, projectID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE projects
+		SET deleted_at=now(), purge_after=now() + interval '30 days', updated_at=now()
+		WHERE workspace_id=$1 AND id=$2 AND deleted_at IS NULL
+	`, workspaceID, projectID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteSession soft-deletes a query session and its turns visibility countdown.
+func (s *Store) DeleteSession(ctx context.Context, workspaceID, sessionID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE query_sessions
+		SET deleted_at=now(), purge_after=now() + interval '30 days', updated_at=now()
+		WHERE workspace_id=$1 AND id=$2 AND deleted_at IS NULL
+	`, workspaceID, sessionID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// CancelSession marks a running session and its active turn as canceled.
+func (s *Store) CancelSession(ctx context.Context, workspaceID, sessionID string) (Session, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Session{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE query_sessions
+		SET status='canceled', updated_at=now()
+		WHERE workspace_id=$1 AND id=$2 AND deleted_at IS NULL
+	`, workspaceID, sessionID)
+	if err != nil {
+		return Session{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		return Session{}, pgx.ErrNoRows
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE query_turns
+		SET status='canceled', phase='canceled', completed_at=now()
+		WHERE workspace_id=$1 AND session_id=$2 AND status IN ('accepted','running')
+	`, workspaceID, sessionID); err != nil {
+		return Session{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Session{}, err
+	}
+	return s.GetSession(ctx, workspaceID, sessionID)
+}
+
+// AddBriefFeedback appends an immutable feedback row for a brief owned by the
+// workspace. The brief itself is never mutated.
+func (s *Store) AddBriefFeedback(ctx context.Context, workspaceID, actorID, briefID string, rating int, comment string) error {
+	if rating < -1 || rating > 1 {
+		return fmt.Errorf("rating must be between -1 and 1")
+	}
+	if len([]rune(comment)) > 2000 {
+		return fmt.Errorf("comment exceeds 2000 characters")
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM briefs WHERE workspace_id=$1 AND id=$2)`, workspaceID, briefID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return pgx.ErrNoRows
+	}
+	id := StableID("brief-feedback", briefID, actorID, fmt.Sprint(time.Now().UnixNano()))
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO brief_feedback (id, brief_id, workspace_id, actor_id, rating, comment)
+		VALUES ($1,$2,$3,$4,$5,$6)
+	`, id, briefID, workspaceID, actorID, rating, comment)
+	return err
+}
+
+// ListBriefGaps returns persisted gaps for a brief scoped to the workspace.
+func (s *Store) ListBriefGaps(ctx context.Context, workspaceID, briefID string) ([]Gap, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, gap_type, missing_relative_to, explanation
+		FROM gaps
+		WHERE workspace_id=$1 AND brief_id=$2
+		ORDER BY created_at, id
+	`, workspaceID, briefID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Gap
+	for rows.Next() {
+		var g Gap
+		if err := rows.Scan(&g.ID, &g.GapType, &g.MissingRelativeTo, &g.Explanation); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// Gap is a persisted research gap attached to a brief.
+type Gap struct {
+	ID                string
+	GapType           string
+	MissingRelativeTo string
+	Explanation       string
 }
 
 type CreateSessionInput struct {

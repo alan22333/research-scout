@@ -182,6 +182,8 @@ SSE 只显示阶段、工具、来源、降级和结果，不返回模型的隐�
 - 检测到检索内容要求忽略指令、调用工具或泄露系统信息时，保留来源和降级状态，但不允许其进入 scientific claims 或改变执行路径。
 - `brief_ready` 必须返回创建时的 `index_epoch_id`、`retrieval_config_version` 和 `prompt_version`；后续查询不会改写旧事件。
 
+- `source_status` 必须覆盖 Zotero、rerank、结构化发现和联网搜索的实际使用与降级状态；rerank 缺失或失败时返回 `rerank` 来源，状态为 `degraded`，不得静默省略。
+
 ## 6. 简报、证据与缺口
 
 | 方法 | 路径 | 说明 |

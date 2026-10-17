@@ -2,7 +2,7 @@ SHELL := /bin/zsh
 GO ?= go
 DB_URL ?= postgres://research:research@localhost:55433/research_scout?sslmode=disable
 
-.PHONY: verify test-unit test-integration test-contract openapi-lint smoke-stage0 eval-rag eval-retrieval eval-brief db-up db-down migrate
+.PHONY: verify test-unit test-integration test-contract openapi-lint smoke-stage0 discovery-smoke eval-rag eval-retrieval eval-brief db-up db-down migrate
 
 verify: openapi-lint test-unit test-integration test-contract
 
@@ -29,6 +29,11 @@ migrate:
 
 smoke-stage0:
 	RS_DATABASE_URL='$(DB_URL)' $(GO) run ./cmd/worker smoke-stage0
+
+# Cost-bounded real-provider check: at most one request per source, no DB needed.
+# Add WEB=1 to also make one provider-native web search request.
+discovery-smoke:
+	$(GO) run ./cmd/worker discovery-smoke $(if $(WEB),-web,)
 
 eval-rag:
 	RS_DATABASE_URL='$(DB_URL)' $(GO) run ./cmd/worker eval-rag

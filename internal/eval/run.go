@@ -14,6 +14,7 @@ import (
 	"research-scout/internal/config"
 	"research-scout/internal/domain"
 	"research-scout/internal/query"
+	"research-scout/internal/retrieval"
 	"research-scout/internal/storage"
 )
 
@@ -23,16 +24,78 @@ type GoldenSet struct {
 }
 
 type GoldenQuestion struct {
-	ID            string   `yaml:"id"`
-	Intent        string   `yaml:"intent"`
-	Question      string   `yaml:"question"`
-	ExpectedTerms []string `yaml:"expected_terms"`
-	MinEvidence   int      `yaml:"min_evidence"`
+	ID                    string   `yaml:"id"`
+	Intent                string   `yaml:"intent"`
+	Mode                  string   `yaml:"mode"`
+	Question              string   `yaml:"question"`
+	ExpectedTerms         []string `yaml:"expected_terms"`
+	MinEvidence           int      `yaml:"min_evidence"`
+	RelevantDocumentIDs   []string `yaml:"relevant_document_ids"`
+	RelevantChunkIDs      []string `yaml:"relevant_chunk_ids"`
+	ExpectedEvidenceTypes []string `yaml:"expected_evidence_types"`
+	ExpectedGapTypes      []string `yaml:"expected_gap_types"`
+	ExpectedClaims        []string `yaml:"expected_claims"`
+	Unanswerable          bool     `yaml:"unanswerable"`
+	Notes                 string   `yaml:"notes"`
 }
 
 type EvalRun struct {
 	Report     Report `json:"report"`
 	ReportPath string `json:"report_path"`
+}
+
+type questionObservation struct {
+	CandidateChunks     []string
+	CandidateDocuments  []string
+	SelectedChunks      []string
+	SelectedDocuments   []string
+	PreRerankChunks     []string
+	PreRerankDocuments  []string
+	PostRerankChunks    []string
+	PostRerankDocuments []string
+	CitationDocuments   []string
+	CitationTypes       []string
+	GapTypes            []string
+	Summary             string
+	TotalClaims         int
+	SupportedClaims     int
+	Abstained           bool
+}
+
+type questionScore struct {
+	RecallAt40           float64
+	RecallAt12           float64
+	MRRAt10              float64
+	NDCGAt10             float64
+	ExactMatchAt3        float64
+	CitationPrecision    float64
+	UnsupportedClaimRate float64
+	AbstentionPrecision  float64
+	GapPrecision         float64
+	RerankDelta          RerankDelta
+}
+
+type evalAggregate struct {
+	Questions             int
+	retrievalLabeled      int
+	recallAt40            float64
+	recallAt12            float64
+	mrrAt10               float64
+	ndcgAt10              float64
+	exactMatchLabeled     int
+	exactMatchAt3         float64
+	citationLabeled       int
+	citationPrecision     float64
+	claimQuestions        int
+	totalClaims           int
+	supportedClaims       int
+	abstentions           int
+	correctAbstentions    int
+	gapLabeled            int
+	gapPrecision          float64
+	rerankLabeled         int
+	rerankRecallAt12Delta float64
+	rerankNDCGAt10Delta   float64
 }
 
 func Run(ctx context.Context, store *storage.Store, engine *query.Engine, cfg config.Config, datasetPath, kind string) (EvalRun, error) {
@@ -53,34 +116,50 @@ func Run(ctx context.Context, store *storage.Store, engine *query.Engine, cfg co
 	if golden.Version == "" || len(golden.Questions) == 0 {
 		return EvalRun{}, fmt.Errorf("golden dataset must contain version and questions")
 	}
-	epochID, err := store.ActiveEpochID(ctx, cfg.DevWorkspaceID)
+	epoch, err := store.ActiveEpochMetadata(ctx, cfg.DevWorkspaceID)
 	if err != nil {
 		return EvalRun{}, fmt.Errorf("active epoch unavailable: %w", err)
 	}
+	epochID := epoch.ID
 	report := NewReport(golden.Version, epochID)
 	report.RunID = "eval-" + time.Now().UTC().Format("20060102T150405.000000000Z")
-	report.RetrievalConfigVersion = engine.Config.RetrievalConfigVersion
-	report.EmbeddingVersion = "stage0-deterministic-embedding-v1"
+	report.PlannerVersion = firstNonEmpty(engine.Config.PlannerVersion, report.PlannerVersion)
+	report.RetrievalConfigVersion = firstNonEmpty(epoch.RetrievalConfigVersion, engine.Config.RetrievalConfigVersion, report.RetrievalConfigVersion)
+	report.EmbeddingVersion = firstNonEmpty(epoch.EmbeddingVersion, report.EmbeddingVersion)
+	report.RerankVersion = firstNonEmpty(engine.Config.RerankVersion, report.RerankVersion, retrieval.FallbackRerankVersion)
+	report.PromptVersion = firstNonEmpty(engine.Config.PromptVersion, report.PromptVersion)
 	report.Metrics = map[string]any{"kind": kind, "questions": len(golden.Questions)}
 	report.PerIntent = map[string]any{}
 	report.SourceStatus = []string{"library:available", "embedding:stub", "external_providers:skipped"}
+	if engine.Reranker == nil {
+		report.SourceStatus = append(report.SourceStatus, "rerank:fallback")
+	}
 
 	var evidenceHits, retrievalHits, traceableClaims, totalClaims int
-	type intentStats struct{ Questions, EvidenceHits, RetrievalHits int }
+	var aggregate evalAggregate
+	type intentStats struct {
+		EvidenceHits  int
+		RetrievalHits int
+		Metrics       evalAggregate
+	}
 	intents := map[string]*intentStats{}
 	for _, q := range golden.Questions {
 		projectID := storage.StableID("eval-project", golden.Version, q.ID)
+		mode := evalModeFor(q)
 		project, err := store.CreateProject(ctx, storage.Project{
 			ID: projectID, WorkspaceID: cfg.DevWorkspaceID, Name: "Eval " + q.ID,
-			Description: "Generated by stage 0 RAG evaluation", DefaultMode: "my_library", ScopeMode: "all_library",
+			Description: "Generated by stage 0 RAG evaluation", DefaultMode: string(mode), ScopeMode: "all_library",
 		})
 		if err != nil {
 			return EvalRun{}, fmt.Errorf("create eval project %s: %w", q.ID, err)
 		}
-		result, err := engine.RunFirst(ctx, cfg.DevWorkspaceID, project.ID, q.Question, domain.RetrievalModeMyLibrary)
+		result, err := engine.RunFirst(ctx, cfg.DevWorkspaceID, project.ID, q.Question, mode)
 		if err != nil {
 			return EvalRun{}, fmt.Errorf("run golden question %s: %w", q.ID, err)
 		}
+		observation := observationFor(result)
+		score := scoreQuestion(q, observation)
+		aggregate.add(q, observation, score)
 		if len(result.Brief.Citations) >= max(1, q.MinEvidence) {
 			evidenceHits++
 		}
@@ -109,7 +188,7 @@ func Run(ctx context.Context, store *storage.Store, engine *query.Engine, cfg co
 			stats = &intentStats{}
 			intents[q.Intent] = stats
 		}
-		stats.Questions++
+		stats.Metrics.add(q, observation, score)
 		if len(result.Brief.Citations) >= max(1, q.MinEvidence) {
 			stats.EvidenceHits++
 		}
@@ -146,12 +225,14 @@ func Run(ctx context.Context, store *storage.Store, engine *query.Engine, cfg co
 	report.Metrics["retrieval_hit_rate"] = ratio(retrievalHits, total)
 	report.Metrics["claim_traceability_rate"] = ratio(traceableClaims, max(1, totalClaims))
 	report.Metrics["claim_count"] = totalClaims
+	for key, value := range aggregate.metrics() {
+		report.Metrics[key] = value
+	}
 	for intent, stats := range intents {
-		report.PerIntent[intent] = map[string]any{
-			"questions":          stats.Questions,
-			"evidence_coverage":  ratio(stats.EvidenceHits, stats.Questions),
-			"retrieval_hit_rate": ratio(stats.RetrievalHits, stats.Questions),
-		}
+		metrics := stats.Metrics.metrics()
+		metrics["evidence_coverage"] = ratio(stats.EvidenceHits, stats.Metrics.Questions)
+		metrics["retrieval_hit_rate"] = ratio(stats.RetrievalHits, stats.Metrics.Questions)
+		report.PerIntent[intent] = metrics
 	}
 	report.HardGateFailures, err = evaluateHardGates(ctx, store, cfg.DevWorkspaceID, epochID)
 	if err != nil {
@@ -173,6 +254,181 @@ func Run(ctx context.Context, store *storage.Store, engine *query.Engine, cfg co
 	return EvalRun{Report: report, ReportPath: path}, nil
 }
 
+func observationFor(result query.RunResult) questionObservation {
+	observation := questionObservation{
+		CandidateChunks:     result.Trace.CandidateChunks,
+		CandidateDocuments:  result.Trace.CandidateDocuments,
+		SelectedChunks:      result.Trace.SelectedChunks,
+		SelectedDocuments:   result.Trace.SelectedDocuments,
+		PreRerankChunks:     result.Trace.PreRerankChunks,
+		PreRerankDocuments:  result.Trace.PreRerankDocuments,
+		PostRerankChunks:    result.Trace.PostRerankChunks,
+		PostRerankDocuments: result.Trace.PostRerankDocuments,
+		Summary:             result.Brief.Summary,
+	}
+	for _, citation := range result.Brief.Citations {
+		if citation.DocumentID != nil {
+			observation.CitationDocuments = append(observation.CitationDocuments, *citation.DocumentID)
+		}
+		observation.CitationTypes = append(observation.CitationTypes, citation.EvidenceType)
+	}
+	for _, gap := range result.Brief.Gaps {
+		observation.GapTypes = append(observation.GapTypes, gap.GapType)
+	}
+	for _, claim := range result.Brief.SummaryClaims {
+		observation.TotalClaims++
+		if len(claim.ClaimEvidence) > 0 && claim.VerificationStatus != string(domain.VerificationRejected) {
+			observation.SupportedClaims++
+		}
+	}
+	for _, claim := range result.Brief.Findings {
+		observation.TotalClaims++
+		if len(claim.ClaimEvidence) > 0 && claim.VerificationStatus != string(domain.VerificationRejected) {
+			observation.SupportedClaims++
+		}
+	}
+	observation.Abstained = len(result.Brief.Citations) == 0 || strings.Contains(strings.ToLower(result.Brief.Summary), "insufficient")
+	return observation
+}
+
+func scoreQuestion(question GoldenQuestion, observation questionObservation) questionScore {
+	relevant := map[string]bool{}
+	candidateRanked := observation.CandidateChunks
+	selectedRanked := observation.SelectedChunks
+	preRerank := observation.PreRerankChunks
+	postRerank := observation.PostRerankChunks
+	if len(question.RelevantChunkIDs) > 0 {
+		for _, id := range question.RelevantChunkIDs {
+			relevant[id] = true
+		}
+	} else if len(question.RelevantDocumentIDs) > 0 {
+		candidateRanked = observation.CandidateDocuments
+		selectedRanked = observation.SelectedDocuments
+		preRerank = observation.PreRerankDocuments
+		postRerank = observation.PostRerankDocuments
+		for _, id := range question.RelevantDocumentIDs {
+			relevant[id] = true
+		}
+	}
+
+	score := questionScore{}
+	if len(relevant) > 0 {
+		candidateMetrics := ComputeRetrievalMetrics(candidateRanked, relevant, 10)
+		selectedMetrics := ComputeRetrievalMetrics(selectedRanked, relevant, 10)
+		score.RecallAt40 = candidateMetrics.RecallAt40
+		score.RecallAt12 = selectedMetrics.RecallAt12
+		score.MRRAt10 = selectedMetrics.MRRAt10
+		score.NDCGAt10 = selectedMetrics.NDCGAt10
+		score.RerankDelta = ComputeRerankDelta(preRerank, postRerank, relevant, 10)
+	}
+
+	if len(question.RelevantDocumentIDs) > 0 {
+		documentRelevance := map[string]bool{}
+		for _, id := range question.RelevantDocumentIDs {
+			documentRelevance[id] = true
+		}
+		score.ExactMatchAt3 = ComputeExactMatchAt3(observation.SelectedDocuments, documentRelevance)
+		score.CitationPrecision = ComputeCitationPrecision(observation.CitationDocuments, documentRelevance)
+	}
+	score.UnsupportedClaimRate = ComputeUnsupportedClaimRate(observation.TotalClaims, observation.SupportedClaims)
+	if observation.Abstained && question.Unanswerable {
+		score.AbstentionPrecision = 1
+	}
+	if len(question.ExpectedGapTypes) > 0 {
+		expected := map[string]bool{}
+		for _, gapType := range question.ExpectedGapTypes {
+			expected[gapType] = true
+		}
+		score.GapPrecision = ComputeGapPrecision(observation.GapTypes, expected)
+	}
+	return score
+}
+
+// evalModeFor resolves the retrieval mode for a golden question. An unset mode
+// defaults to my_library so the Stage 0/2 datasets keep their behavior.
+func evalModeFor(question GoldenQuestion) domain.RetrievalMode {
+	mode := domain.RetrievalMode(strings.TrimSpace(question.Mode))
+	switch mode {
+	case domain.RetrievalModeMyLibrary, domain.RetrievalModeGapFill, domain.RetrievalModeLandscape:
+		return mode
+	default:
+		return domain.RetrievalModeMyLibrary
+	}
+}
+
+func (a *evalAggregate) add(question GoldenQuestion, observation questionObservation, score questionScore) {
+	a.Questions++
+	if len(question.RelevantChunkIDs) > 0 || len(question.RelevantDocumentIDs) > 0 {
+		a.retrievalLabeled++
+		a.recallAt40 += score.RecallAt40
+		a.recallAt12 += score.RecallAt12
+		a.mrrAt10 += score.MRRAt10
+		a.ndcgAt10 += score.NDCGAt10
+	}
+	if len(question.RelevantDocumentIDs) > 0 {
+		a.exactMatchLabeled++
+		a.exactMatchAt3 += score.ExactMatchAt3
+		a.citationLabeled++
+		a.citationPrecision += score.CitationPrecision
+	}
+	if observation.TotalClaims > 0 {
+		a.claimQuestions++
+		a.totalClaims += observation.TotalClaims
+		a.supportedClaims += observation.SupportedClaims
+	}
+	if observation.Abstained {
+		a.abstentions++
+		if question.Unanswerable {
+			a.correctAbstentions++
+		}
+	}
+	if len(question.RelevantChunkIDs) > 0 || len(question.RelevantDocumentIDs) > 0 {
+		a.rerankLabeled++
+		a.rerankRecallAt12Delta += score.RerankDelta.RecallAt12
+		a.rerankNDCGAt10Delta += score.RerankDelta.NDCGAt10
+	}
+	if len(question.ExpectedGapTypes) > 0 {
+		a.gapLabeled++
+		a.gapPrecision += score.GapPrecision
+	}
+}
+
+func (a evalAggregate) metrics() map[string]any {
+	return map[string]any{
+		"questions":                   a.Questions,
+		"retrieval_labeled_questions": a.retrievalLabeled,
+		"recall_at_40":                average(a.recallAt40, a.retrievalLabeled),
+		"recall_at_12":                average(a.recallAt12, a.retrievalLabeled),
+		"mrr_at_10":                   average(a.mrrAt10, a.retrievalLabeled),
+		"ndcg_at_10":                  average(a.ndcgAt10, a.retrievalLabeled),
+		"exact_match_at_3":            average(a.exactMatchAt3, a.exactMatchLabeled),
+		"citation_precision":          average(a.citationPrecision, a.citationLabeled),
+		"unsupported_claim_rate":      ComputeUnsupportedClaimRate(a.totalClaims, a.supportedClaims),
+		"abstention_precision":        ComputeAbstentionPrecision(a.abstentions, a.correctAbstentions),
+		"gap_precision":               average(a.gapPrecision, a.gapLabeled),
+		"rerank_delta": map[string]any{
+			"recall_at_12_delta": average(a.rerankRecallAt12Delta, a.rerankLabeled),
+			"ndcg_at_10_delta":   average(a.rerankNDCGAt10Delta, a.rerankLabeled),
+		},
+	}
+}
+
+func average(sum float64, count int) float64 {
+	if count <= 0 {
+		return 0
+	}
+	return sum / float64(count)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func evaluateHardGates(ctx context.Context, store *storage.Store, workspaceID, epochID string) ([]string, error) {
 	failures := []string{}
 	var missing int
@@ -188,6 +444,11 @@ func evaluateHardGates(ctx context.Context, store *storage.Store, workspaceID, e
 		failures = append(failures, fmt.Sprintf("%d verified/partial claim(s) lack claim_evidence", missing))
 	}
 
+	// Traceability is evidence-type specific. Personal fulltext must resolve to a
+	// document, document_version and chunk; structured abstracts must carry the
+	// external work they came from; web context must carry a source URL. A single
+	// uniform document/chunk requirement would wrongly fail Stage 3 external
+	// evidence, which never has a local document version.
 	var badTrace int
 	if err := store.Pool().QueryRow(ctx, `
 		SELECT count(*)
@@ -197,12 +458,21 @@ func evaluateHardGates(ctx context.Context, store *storage.Store, workspaceID, e
 		LEFT JOIN document_versions dv ON dv.id=e.document_version_id
 		LEFT JOIN chunks ch ON ch.id=e.chunk_id
 		WHERE ce.workspace_id=$1
-			AND (dv.id IS NULL OR ch.id IS NULL OR e.document_id IS NULL OR e.document_version_id IS NULL)
+			AND (
+				(e.evidence_type='personal_fulltext'
+					AND (e.document_id IS NULL OR e.document_version_id IS NULL OR e.chunk_id IS NULL
+						OR dv.id IS NULL OR ch.id IS NULL))
+				OR (e.evidence_type='structured_abstract'
+					AND (e.external_work_id IS NULL OR e.external_work_id=''))
+				OR (e.evidence_type='web_context'
+					AND (e.url IS NULL OR e.url=''))
+				OR e.evidence_type NOT IN ('personal_fulltext','structured_abstract','web_context')
+			)
 	`, workspaceID).Scan(&badTrace); err != nil {
 		return nil, err
 	}
 	if badTrace > 0 {
-		failures = append(failures, fmt.Sprintf("%d evidence relation(s) lack document_version/chunk traceability", badTrace))
+		failures = append(failures, fmt.Sprintf("%d evidence relation(s) lack type-appropriate traceability", badTrace))
 	}
 
 	var metadataEvidence int

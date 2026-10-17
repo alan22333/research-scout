@@ -5,6 +5,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
+
+	"research-scout/internal/retrieval"
 )
 
 type Config struct {
@@ -21,7 +24,14 @@ type Config struct {
 	ZoteroRequestConcurrency    int
 	SecretKey                   string
 	S2APIKey                    string
+	S2RequestsPerSec            int
 	OpenAlexEmail               string
+	DashScopeAPIKey             string
+	DashScopeBaseURL            string
+	QwenSearchModel             string
+	DiscoveryEnabled            bool
+	WebSearchEnabled            bool
+	DiscoveryTimeout            time.Duration
 	LLMBaseURL                  string
 	LLMAPIKey                   string
 	LLMModel                    string
@@ -36,6 +46,7 @@ type Config struct {
 	IndexEpochPublishMode       string
 	PlannerVersion              string
 	RetrievalConfigVersion      string
+	RerankVersion               string
 	PromptVersion               string
 	RAGEvalDataset              string
 	WorkerConcurrency           int
@@ -67,7 +78,14 @@ func Load() (Config, error) {
 		ZoteroRequestConcurrency:    envInt("ZOTERO_REQUEST_CONCURRENCY", 4),
 		SecretKey:                   env("SECRET_KEY", "local-dev-secret-change-me"),
 		S2APIKey:                    os.Getenv("S2_API_KEY"),
+		S2RequestsPerSec:            envInt("S2_REQUESTS_PER_SECOND", 1),
 		OpenAlexEmail:               os.Getenv("OPENALEX_EMAIL"),
+		DashScopeAPIKey:             envAny([]string{"DASHSCOPE_API_KEY", "QWEN_SEARCH_API_KEY"}, ""),
+		DashScopeBaseURL:            env("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		QwenSearchModel:             env("QWEN_SEARCH_MODEL", "qwen-plus"),
+		DiscoveryEnabled:            envBool("DISCOVERY_ENABLED", false),
+		WebSearchEnabled:            envBool("WEB_SEARCH_ENABLED", false),
+		DiscoveryTimeout:            envDuration("DISCOVERY_TIMEOUT", 20*time.Second),
 		LLMBaseURL:                  os.Getenv("LLM_BASE_URL"),
 		LLMAPIKey:                   os.Getenv("LLM_API_KEY"),
 		LLMModel:                    env("LLM_MODEL", "qwen-plus"),
@@ -82,6 +100,7 @@ func Load() (Config, error) {
 		IndexEpochPublishMode:       env("INDEX_EPOCH_PUBLISH_MODE", "atomic"),
 		PlannerVersion:              env("PLANNER_VERSION", "planner-v1"),
 		RetrievalConfigVersion:      env("RETRIEVAL_CONFIG_VERSION", "retrieval-v1"),
+		RerankVersion:               env("RERANK_VERSION", retrieval.FallbackRerankVersion),
 		PromptVersion:               env("PROMPT_VERSION", "brief-v1"),
 		RAGEvalDataset:              env("RAG_EVAL_DATASET", "eval/golden/rag-golden-v1.yaml"),
 		WorkerConcurrency:           envInt("WORKER_CONCURRENCY", 4),
@@ -120,6 +139,18 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 func envInt(key string, fallback int) int {

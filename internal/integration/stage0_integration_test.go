@@ -264,6 +264,7 @@ func cleanupWorkspace(t *testing.T, store *storage.Store, workspaceID, actorID s
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	statements := []string{
+		`DELETE FROM brief_feedback WHERE workspace_id=$1`,
 		`DELETE FROM claim_evidence WHERE workspace_id=$1`,
 		`DELETE FROM claims WHERE workspace_id=$1`,
 		`DELETE FROM evidence WHERE workspace_id=$1`,
@@ -275,6 +276,7 @@ func cleanupWorkspace(t *testing.T, store *storage.Store, workspaceID, actorID s
 		`DELETE FROM projects WHERE workspace_id=$1`,
 		`DELETE FROM lifecycle_tombstones WHERE workspace_id=$1`,
 		`DELETE FROM audit_events WHERE workspace_id=$1`,
+		`DELETE FROM external_citation_edges WHERE workspace_id=$1`,
 		`DELETE FROM external_works WHERE workspace_id=$1`,
 		`DELETE FROM chunks WHERE workspace_id=$1`,
 		`DELETE FROM index_epoch_documents WHERE workspace_id=$1`,

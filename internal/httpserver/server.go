@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 
 	"research-scout/internal/config"
 	"research-scout/internal/domain"
@@ -50,11 +52,14 @@ func NewRouter(cfg config.Config, store *storage.Store, engine *query.Engine, ad
 		v1.POST("/projects", s.createProject)
 		v1.GET("/projects/:projectId", s.getProject)
 		v1.PATCH("/projects/:projectId", s.patchProject)
+		v1.DELETE("/projects/:projectId", s.deleteProject)
 		v1.GET("/projects/:projectId/scope", s.getScope)
 		v1.PUT("/projects/:projectId/scope", s.putScope)
 		v1.GET("/projects/:projectId/sessions", s.listSessions)
 		v1.POST("/projects/:projectId/sessions", s.createSession)
 		v1.GET("/sessions/:sessionId", s.getSession)
+		v1.DELETE("/sessions/:sessionId", s.deleteSession)
+		v1.POST("/sessions/:sessionId/cancel", s.cancelSession)
 		v1.GET("/sessions/:sessionId/turns", s.listTurns)
 		v1.POST("/sessions/:sessionId/turns", s.createTurn)
 		v1.GET("/sessions/:sessionId/events", s.sessionEvents)
@@ -62,7 +67,12 @@ func NewRouter(cfg config.Config, store *storage.Store, engine *query.Engine, ad
 		v1.GET("/briefs/:briefId", s.getBrief)
 		v1.GET("/briefs/:briefId/evidence", s.listBriefEvidence)
 		v1.GET("/briefs/:briefId/gaps", s.listBriefGaps)
+		v1.POST("/briefs/:briefId/feedback", s.createBriefFeedback)
+		v1.GET("/briefs/:briefId/export", s.exportBrief)
 		v1.GET("/evidence/:evidenceId", s.getEvidence)
+		v1.GET("/discovery/search", s.searchDiscovery)
+		v1.GET("/discovery/works/:externalWorkId", s.getDiscoveryWork)
+		v1.GET("/discovery/works/:externalWorkId/citations", s.getDiscoveryCitations)
 	}
 	return r
 }
@@ -273,7 +283,8 @@ func (s *Server) putScope(c *gin.Context) {
 	}
 	p, err := s.Store.UpdateProjectScope(c.Request.Context(), id.WorkspaceID, c.Param("projectId"), in.ScopeMode, in.CollectionIDs)
 	if err != nil {
-		writeError(c, http.StatusBadRequest, "invalid_request", err.Error(), false)
+		code, status := mapScopeError(err)
+		writeError(c, status, code, err.Error(), false)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"scope_mode": p.ScopeMode, "collection_ids": p.CollectionIDs, "version": p.ScopeVersion, "created_at": p.UpdatedAt})
@@ -339,7 +350,7 @@ func (s *Server) getSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"id": sess.ID, "project_id": sess.ProjectID, "current_turn_id": currentTurnID, "mode": mode,
 		"status": sess.Status, "phase": sess.Phase, "events_url": "/api/v1/sessions/" + sess.ID + "/events",
-		"source_status": []query.SourceStatus{{Source: "zotero", Status: "available"}, {Source: "semantic_scholar", Status: "skipped"}, {Source: "qwen_web_search", Status: "skipped"}},
+		"source_status": query.DefaultSourceStatuses(),
 		"created_at":    sess.CreatedAt,
 	})
 }
@@ -422,11 +433,226 @@ func (s *Server) listBriefEvidence(c *gin.Context) {
 }
 
 func (s *Server) listBriefGaps(c *gin.Context) {
-	_, ok := s.requireIdentity(c)
+	id, ok := s.requireIdentity(c)
 	if !ok {
 		return
 	}
-	c.JSON(http.StatusOK, []query.GapView{})
+	briefID := c.Param("briefId")
+	if _, err := s.Engine.GetBriefByID(c.Request.Context(), id.WorkspaceID, briefID); err != nil {
+		writeError(c, http.StatusNotFound, "not_found", "brief not found", false)
+		return
+	}
+	items, err := s.Engine.ListGaps(c.Request.Context(), id.WorkspaceID, briefID)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "internal", err.Error(), true)
+		return
+	}
+	if items == nil {
+		items = []query.GapView{}
+	}
+	c.JSON(http.StatusOK, items)
+}
+
+// searchDiscovery exposes the structured external discovery read model. It is
+// mode-gated and never calls web search.
+func (s *Server) searchDiscovery(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	topic := strings.TrimSpace(c.Query("q"))
+	if topic == "" {
+		writeError(c, http.StatusBadRequest, "invalid_request", "q is required", false)
+		return
+	}
+	mode := domain.RetrievalModeGapFill
+	if raw := strings.TrimSpace(c.Query("mode")); raw != "" {
+		mode = domain.RetrievalMode(raw)
+	}
+	page, err := s.Engine.SearchExternal(c.Request.Context(), id.WorkspaceID, topic, mode, c.QueryArray("sources"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", err.Error(), false)
+		return
+	}
+	items := page.Items
+	if items == nil {
+		items = []query.ExternalWorkView{}
+	}
+	sourceStatus := page.SourceStatus
+	if sourceStatus == nil {
+		sourceStatus = []query.SourceStatus{}
+	}
+	meta := gin.H{"next_cursor": nil}
+	if page.NextCursor != "" {
+		meta["next_cursor"] = page.NextCursor
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "meta": meta, "source_status": sourceStatus})
+}
+
+// getDiscoveryWork returns one workspace-scoped external work.
+func (s *Server) getDiscoveryWork(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	work, err := s.Engine.GetExternalWorkView(c.Request.Context(), id.WorkspaceID, c.Param("externalWorkId"))
+	if err != nil {
+		writeError(c, http.StatusNotFound, "not_found", "external work not found", false)
+		return
+	}
+	c.JSON(http.StatusOK, work)
+}
+
+// getDiscoveryCitations returns the read-only citation/reference relations for
+// one external work. It never expands into a second discovery hop.
+func (s *Server) getDiscoveryCitations(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	items, err := s.Engine.ListCitedWorks(c.Request.Context(), id.WorkspaceID, c.Param("externalWorkId"))
+	if err != nil {
+		writeError(c, http.StatusNotFound, "not_found", "external work not found", false)
+		return
+	}
+	if items == nil {
+		items = []query.ExternalWorkView{}
+	}
+	c.JSON(http.StatusOK, items)
+}
+
+func (s *Server) deleteProject(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	if err := s.Store.DeleteProject(c.Request.Context(), id.WorkspaceID, c.Param("projectId")); err != nil {
+		writeError(c, http.StatusNotFound, "not_found", "project not found", false)
+		return
+	}
+	c.JSON(http.StatusAccepted, lifecycleTombstone(id.WorkspaceID, "project", c.Param("projectId")))
+}
+
+func (s *Server) deleteSession(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	if err := s.Store.DeleteSession(c.Request.Context(), id.WorkspaceID, c.Param("sessionId")); err != nil {
+		writeError(c, http.StatusNotFound, "not_found", "session not found", false)
+		return
+	}
+	c.JSON(http.StatusAccepted, lifecycleTombstone(id.WorkspaceID, "query_session", c.Param("sessionId")))
+}
+
+func (s *Server) cancelSession(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	sess, err := s.Store.CancelSession(c.Request.Context(), id.WorkspaceID, c.Param("sessionId"))
+	if err != nil {
+		writeError(c, http.StatusNotFound, "not_found", "session not found", false)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"id": sess.ID, "project_id": sess.ProjectID, "status": sess.Status, "phase": sess.Phase,
+		"events_url": "/api/v1/sessions/" + sess.ID + "/events",
+		"created_at": sess.CreatedAt, "updated_at": sess.UpdatedAt,
+	})
+}
+
+func (s *Server) createBriefFeedback(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	var in struct {
+		Rating  *int   `json:"rating"`
+		Comment string `json:"comment"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_request", err.Error(), false)
+		return
+	}
+	if in.Rating == nil || *in.Rating < -1 || *in.Rating > 1 {
+		writeError(c, http.StatusBadRequest, "invalid_request", "rating must be -1, 0, or 1", false)
+		return
+	}
+	if len([]rune(in.Comment)) > 2000 {
+		writeError(c, http.StatusBadRequest, "invalid_request", "comment exceeds 2000 characters", false)
+		return
+	}
+	if err := s.Store.AddBriefFeedback(c.Request.Context(), id.WorkspaceID, id.ActorID, c.Param("briefId"), *in.Rating, in.Comment); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "not_found", "brief not found", false)
+			return
+		}
+		writeError(c, http.StatusBadRequest, "invalid_request", err.Error(), false)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) exportBrief(c *gin.Context) {
+	id, ok := s.requireIdentity(c)
+	if !ok {
+		return
+	}
+	brief, err := s.Engine.GetBriefByID(c.Request.Context(), id.WorkspaceID, c.Param("briefId"))
+	if err != nil {
+		writeError(c, http.StatusNotFound, "not_found", "brief not found", false)
+		return
+	}
+	format := strings.ToLower(strings.TrimSpace(c.DefaultQuery("format", "json")))
+	switch format {
+	case "json":
+		c.JSON(http.StatusOK, brief)
+	case "bibtex":
+		c.Data(http.StatusOK, "application/x-bibtex; charset=utf-8", []byte(renderBibTeX(brief)))
+	case "csv":
+		c.Data(http.StatusOK, "text/csv; charset=utf-8", []byte(renderCSV(brief)))
+	default:
+		writeError(c, http.StatusBadRequest, "invalid_request", "unsupported export format", false)
+	}
+}
+
+func lifecycleTombstone(workspaceID, objectType, objectID string) gin.H {
+	purgeAfter := time.Now().UTC().Add(30 * 24 * time.Hour)
+	return gin.H{
+		"id":          storage.StableID("tombstone", workspaceID, objectType, objectID),
+		"object_type": objectType, "object_id": objectID, "reason": "user_requested",
+		"status": "active", "purge_after": purgeAfter,
+	}
+}
+
+func renderBibTeX(brief query.BriefView) string {
+	var b strings.Builder
+	seen := map[string]bool{}
+	for _, ev := range brief.Citations {
+		if ev.Title == "" || seen[ev.Title] {
+			continue
+		}
+		seen[ev.Title] = true
+		key := "citation" + strconv.Itoa(len(seen))
+		fmt.Fprintf(&b, "@misc{%s,\n  title = {%s},\n  note = {Research Scout brief %s},\n  howpublished = {\\url{/api/v1/evidence/%s}}\n}\n\n",
+			key, ev.Title, brief.ID, ev.ID)
+	}
+	return b.String()
+}
+
+func renderCSV(brief query.BriefView) string {
+	var b strings.Builder
+	b.WriteString("title,evidence_type,score,evidence_id\n")
+	seen := map[string]bool{}
+	for _, ev := range brief.Citations {
+		if ev.Title == "" || seen[ev.Title] {
+			continue
+		}
+		seen[ev.Title] = true
+		fmt.Fprintf(&b, "%q,%s,%.6f,%s\n", ev.Title, ev.EvidenceType, ev.Score, ev.ID)
+	}
+	return b.String()
 }
 
 func (s *Server) getEvidence(c *gin.Context) {
@@ -489,6 +715,14 @@ func mapEngineError(err error) (string, int) {
 	if err == nil {
 		return "", http.StatusOK
 	}
+	switch {
+	case errors.Is(err, storage.ErrScopeEmpty):
+		return "scope_empty", http.StatusUnprocessableEntity
+	case errors.Is(err, storage.ErrForbidden):
+		return "forbidden", http.StatusForbidden
+	case errors.Is(err, storage.ErrConflict):
+		return "conflict", http.StatusConflict
+	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "index_not_ready"):
@@ -499,6 +733,21 @@ func mapEngineError(err error) (string, int) {
 		return "not_found", http.StatusNotFound
 	default:
 		return "internal", http.StatusInternalServerError
+	}
+}
+
+// mapScopeError maps scope validation errors to stable HTTP codes. Validation
+// failures must never be reported as a generic 400.
+func mapScopeError(err error) (string, int) {
+	switch {
+	case errors.Is(err, storage.ErrScopeEmpty):
+		return "scope_empty", http.StatusUnprocessableEntity
+	case errors.Is(err, storage.ErrForbidden):
+		return "forbidden", http.StatusForbidden
+	case errors.Is(err, pgx.ErrNoRows):
+		return "not_found", http.StatusNotFound
+	default:
+		return "invalid_request", http.StatusBadRequest
 	}
 }
 
