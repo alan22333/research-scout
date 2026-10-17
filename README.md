@@ -55,6 +55,30 @@ make eval-rag
 make verify
 ```
 
+本地配置与真实凭据：
+
+```bash
+# 首次创建本地配置（.env 已被 Git 忽略）
+cp .env.example .env
+chmod 600 .env
+
+# 填入 Key 后，在当前终端加载
+set -a
+source .env
+set +a
+
+# 成本受控地验证外部来源
+go run ./cmd/worker discovery-smoke
+```
+
+- `S2_API_KEY`：Semantic Scholar Graph API。
+- `OPENALEX_EMAIL`：OpenAlex polite pool 邮箱（不是 Key）。
+- `DASHSCOPE_API_KEY`：百炼/DashScope 的 compatible-mode Key，需支持 `enable_search` 才能启用真实联网搜索。
+- `ZOTERO_API_KEY` + `ZOTERO_LIBRARY_ID`：真实 Zotero Web API 同步；也可改用权限为 `600` 的 `ZOTERO_API_KEY_FILE`。
+- `LLM_API_KEY`、`EMBEDDING_API_KEY`、`RERANK_API_KEY`：阶段 4 真实生成层预留，当前代码尚未接线。
+
+默认 `DISCOVERY_ENABLED=false`、`WEB_SEARCH_ENABLED=false`，不会产生外部调用。人工验证时再按需改为 `true`。
+
 真实外部来源（Semantic Scholar / OpenAlex / Qwen 联网搜索）默认关闭，不参与 CI。
 需要人工确认真实调用时，用成本受控的一次性 smoke：每个来源最多 1 次请求，只输出状态与公开计数，
 不落库、不打印任何密钥（联网搜索需显式加 `-web`）。

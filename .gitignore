@@ -2,3 +2,8 @@
 eval/reports/*.json
 research-scout
 *.log
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
