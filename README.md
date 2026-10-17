@@ -86,9 +86,13 @@ go run ./cmd/worker discovery-smoke
 ```bash
 # 只查结构化来源（无需数据库）
 go run ./cmd/worker discovery-smoke
-# 额外做 1 次联网搜索（需 DASHSCOPE_API_KEY 等已配置）
-go run ./cmd/worker discovery-smoke -web
+# 只做 1 次联网搜索（需 DASHSCOPE_API_KEY 等已配置）
+go run ./cmd/worker discovery-smoke -sources web
+# 也可按来源单独验证：-sources s2、-sources openalex 或逗号组合
 ```
+
+Qwen/DashScope 当前可能只在回答正文中返回 URL，而不返回结构化 `search_info`。此时 smoke 会显示
+`degraded` / `web_search_content_fallback`，表示链接可用但来源元数据不如结构化响应可靠；这不等于请求失败。
 
 真实来源只在确认要调用时才通过环境变量开启：`S2_API_KEY`、`OPENALEX_EMAIL`、
 `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`、`QWEN_SEARCH_MODEL`，以及 `DISCOVERY_ENABLED`、
@@ -131,7 +135,7 @@ go run ./cmd/api
 
 - Zotero OAuth 1.0a（开发期使用只读 API Key；OAuth 流程留待试点前 ADR）。
 - 真实 LLM 生成层（Brief 仍用确定性证据抽取）、真实 Embedding 与 Rerank Provider 接线。
-- 联网搜索的真实凭据联通（现有 DashScope 凭据仅覆盖自建 rerank 端点，返回 401，显式降级）。
+- 联网搜索来源元数据的完整结构化返回（Qwen compatible-mode 实测可能不返回 `search_info`；当前从回答正文提取 URL，并显式标记 `degraded` / `web_search_content_fallback`）。
 - 引用图二次召回（`/discovery/works/{id}/citations` 目前只做只读透传）。
 - Web 工作台（`web/` 仍为空壳）、研究简报 UI、SSE 前端消费。
 - 多租户权限、管理员审计、30 天清理调度、备份恢复与生产部署（Docker Compose 单机）。

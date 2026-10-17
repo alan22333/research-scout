@@ -244,3 +244,54 @@ func TestSemanticScholarDecodesMixedExternalIDs(t *testing.T) {
 		t.Fatalf("doi=%q pmid=%q want 10.1/seven / 99887766", res.Works[0].DOI, res.Works[0].PMID)
 	}
 }
+
+func TestQwenWebSearchExtractsURLsFromAnswerContent(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"resp-fallback","choices":[{"message":{"content":"Sources:\nRetrieval Evaluation Overview\n🔗 https://example.org/paper\nAnother Source\n🔗 https://example.com/report。"}}]}`)
+	}))
+	defer srv.Close()
+
+	p := NewQwenWebSearch(QwenWebSearchConfig{BaseURL: srv.URL, APIKey: "test-key", Model: "qwen-plus", Client: srv.Client()})
+	res, err := p.Search(context.Background(), WebSearchQuery{Topic: "topic", Limit: 5})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(res.Contexts) != 2 {
+		t.Fatalf("contexts=%+v want 2", res.Contexts)
+	}
+	if res.Status != WebSearchDegraded || res.Reason != "web_search_content_fallback" {
+		t.Fatalf("status=%s reason=%s want degraded/content fallback", res.Status, res.Reason)
+	}
+	if res.Contexts[0].URL != "https://example.org/paper" {
+		t.Fatalf("url=%q", res.Contexts[0].URL)
+	}
+	if res.Contexts[0].Title != "Retrieval Evaluation Overview" {
+		t.Fatalf("title=%q", res.Contexts[0].Title)
+	}
+	if res.Contexts[1].URL != "https://example.com/report" {
+		t.Fatalf("url=%q want punctuation trimmed", res.Contexts[1].URL)
+	}
+}
+
+func TestQwenWebSearchExtractsMarkdownLinkTitle(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"resp-md","choices":[{"message":{"content":"1. [Grounded RAG](https://example.org/rag) - useful overview"}}]}`)
+	}))
+	defer srv.Close()
+
+	p := NewQwenWebSearch(QwenWebSearchConfig{BaseURL: srv.URL, APIKey: "test-key", Model: "qwen-plus", Client: srv.Client()})
+	res, err := p.Search(context.Background(), WebSearchQuery{Topic: "topic", Limit: 5})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(res.Contexts) != 1 {
+		t.Fatalf("contexts=%+v want 1", res.Contexts)
+	}
+	if res.Contexts[0].Title != "Grounded RAG" || res.Contexts[0].URL != "https://example.org/rag" {
+		t.Fatalf("context=%+v", res.Contexts[0])
+	}
+}

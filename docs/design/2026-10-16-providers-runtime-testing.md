@@ -111,12 +111,14 @@ unavailable | rate_limited | unauthorized | invalid_response | timeout | timeout
 - 需要最新进展时允许受控 `freshness`；默认不限制时间。
 - 不把完整个人 fulltext 或私人问题拼进搜索 query；只传去标识化研究主题和必要上下文。
 - 搜索结果记录 provider、model、query fingerprint、retrieved_at、URL、title、snippet 和原始响应 ID。
+- compatible-mode 未返回 `search_info` 时，可从回答正文的 Markdown/裸 HTTP(S) 链接回退提取来源，但必须标记 `degraded` / `web_search_content_fallback`，不得把模型总结冒充网页原文。
 
 ### 3.3 降级
 
 - Key 缺失：`web_search_unavailable`，不重复调用。
 - 时间/配额错误：记录 source status，当前 turn 继续。
-- 返回无 URL citation：丢弃网页证据并返回 `invalid_response`。
+- 结构化 `search_info` 为空但正文含 URL：接收为降级 `web_context`，reason 为 `web_search_content_fallback`。
+- 完全没有 URL citation：丢弃网页证据并返回 `web_search_unavailable` / `web_search_no_sources`。
 - Provider 不支持原生搜索：不自动推断使用第三方 API；后续通过新 adapter 接入。
 
 ## 4. Semantic Scholar 与 OpenAlex

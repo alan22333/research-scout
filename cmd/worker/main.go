@@ -44,6 +44,7 @@ func run() error {
 	apiKeyFile := fs.String("api-key-file", env("ZOTERO_API_KEY_FILE", ""), "path to a chmod 600 file holding the Zotero API key")
 	smokeTopic := fs.String("topic", "reciprocal rank fusion hybrid retrieval", "topic for one bounded discovery-smoke search")
 	smokeWeb := fs.Bool("web", false, "also make one bounded provider-native web search request")
+	smokeSources := fs.String("sources", "", "discovery-smoke sources: s2,openalex,web (default: s2,openalex; add -web for web)")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
 	}
@@ -64,7 +65,8 @@ func run() error {
 	// discovery-smoke is a read-only, cost-bounded provider check: it needs no
 	// database and never persists results, so it runs before the store opens.
 	if command == "discovery-smoke" {
-		return printJSON(runDiscoverySmoke(ctx, cfg, *smokeTopic, *smokeWeb), nil)
+		result, err := runDiscoverySmoke(ctx, cfg, *smokeTopic, *smokeWeb, *smokeSources)
+		return printJSON(result, err)
 	}
 
 	store, err := storage.Open(ctx, cfg.DatabaseURL)

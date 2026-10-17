@@ -206,7 +206,8 @@ DOI -> S2 ID -> OpenAlex ID -> PMID -> title fingerprint + year
 
 适配器：
 
-- 解析 `search_info`/tool output 中的标题、URL、时间和可用片段。
+- 优先解析 `search_info`/tool output 中的标题、URL、时间和可用片段。
+- `search_info` 缺失时，可从回答正文的 Markdown/裸 HTTP(S) 链接降级提取 URL；状态固定为 `degraded`，reason 为 `web_search_content_fallback`。
 - 只有带 URL 的结果可以形成 `web_context` Evidence。
 - 不把模型生成的自然语言总结冒充网页原文；它只能作为带引用的背景。
 - 需要时效问题时允许设置受控 `freshness`；默认不设置，避免误删经典工作。
